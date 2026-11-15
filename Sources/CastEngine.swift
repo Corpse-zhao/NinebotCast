@@ -118,6 +118,13 @@ final class CastEngine: ObservableObject {
         video.onReceive = { [weak self] data in
             self?.handleControlReceive(data)
         }
+        // 本机 5012/5013 被九号出行占用时的降级提示（onFallback 已在主线程）
+        let fallbackNote: (String) -> Void = { [weak self] note in
+            self?.dashboardReport = note
+            Diag.log(note)
+        }
+        video.onFallback = fallbackNote
+        control.onFallback = fallbackNote
 
         if !pingOnly {
             let encoder = H264Encoder()
