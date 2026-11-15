@@ -17,8 +17,7 @@ final class H264Encoder {
         teardown()
 
         let spec: [CFString: Any] = [
-            kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: true,
-            kVTVideoEncoderSpecification_PreferHardwareAcceleratedVideoEncoder: true
+            kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: true
         ]
 
         var sessionOut: VTCompressionSession?
@@ -36,7 +35,7 @@ final class H264Encoder {
                 encoder.handleOutput(sampleBuffer: sampleBuffer)
             },
             refcon: Unmanaged.passUnretained(self).toOpaque(),
-            compressionSessionQueue: callbackQueue,
+            compressedDataAllocator: kCFAllocatorDefault,
             compressionSessionOut: &sessionOut)
 
         guard status == noErr, let session = sessionOut else {
@@ -78,7 +77,7 @@ final class H264Encoder {
 
     func teardown() {
         if let session {
-            VTCompressionSessionEndCompressionSession(session)
+            VTCompressionSessionInvalidate(session)
         }
         session = nil
         formatDescription = nil
@@ -150,11 +149,11 @@ final class H264Encoder {
             CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
                 desc, parameterSetIndex: 0,
                 parameterSetPointerOut: &spsPointer, parameterSetSizeOut: &spsSize,
-                numberOfParameterSetsOut: nil, nalUnitHeaderLengthOut: nil) == noErr,
+                parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil) == noErr,
             CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
                 desc, parameterSetIndex: 1,
                 parameterSetPointerOut: &ppsPointer, parameterSetSizeOut: &ppsSize,
-                numberOfParameterSetsOut: nil, nalUnitHeaderLengthOut: nil) == noErr,
+                parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil) == noErr,
             let sps = spsPointer, let pps = ppsPointer
         else { return nil }
 

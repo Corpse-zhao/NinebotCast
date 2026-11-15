@@ -4,7 +4,7 @@ import Foundation
 /// 注意：kcp 的 conv / 模式参数（nodelay 配置、远端 ACK 是否直连 5012）
 /// 需要拿到七寸真实抓包后核对，当前按作者仓库说明的常规参数配置。
 final class KCPChannel {
-    private var kcp: UnsafeMutablePointer<IKCP>?
+    private var kcp: UnsafeMutablePointer<ikcpcb>?
     private let output: (Data) -> Void
 
     init(conv: UInt32, output: @escaping (Data) -> Void) {
@@ -13,7 +13,7 @@ final class KCPChannel {
             fatalError("ikcp_create failed")
         }
         kcp = created
-        ikcp_setoutput(created) { buffer, length, user in
+        ikcp_setoutput(created) { buffer, length, _, user in
             guard let user, let buffer, length > 0 else { return -1 }
             let channel = Unmanaged<KCPChannel>.fromOpaque(user).takeUnretainedValue()
             channel.output(Data(bytes: UnsafeRawPointer(buffer), count: Int(length)))

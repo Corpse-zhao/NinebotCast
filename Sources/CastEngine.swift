@@ -124,16 +124,16 @@ final class CastEngine: ObservableObject {
             width: preset.width,
             height: preset.height) else { return }
         frameIndex &+= 1
-        let time = CMTime(value: CMInt64(frameIndex), timescale: preset.fps)
-        encoder.encode(pixelBuffer, presentationTime: time)
+        let time = CMTime(value: frameIndex, timescale: preset.fps)
+        encoder.encode(pixelBuffer, presentationTimeStamp: time)
     }
 
     private func handleEncodedFrame(_ annexB: Data) {
         callbackQueue.sync {
-            guard let selfPacker = packer else { return }
+            guard packer != nil else { return }
             let nalus = AnnexB.split(annexB)
             guard !nalus.isEmpty else { return }
-            let packets = selfPacker.packetizeFrame(nalus: nalus, fps: preset.fps)
+            let packets = packer!.packetizeFrame(nalus: nalus, fps: preset.fps)
 
             if let kcp = kcpChannel {
                 for packet in packets { kcp.send(packet) }
