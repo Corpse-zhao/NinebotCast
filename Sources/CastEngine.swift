@@ -1,5 +1,6 @@
 import Foundation
 import CoreMedia
+import UIKit
 
 /// 投屏引擎：帧定时器 → 测试图 → VideoToolbox → RTP 打包 → UDP 5012
 /// RTCP ping/pong 走 UDP 5013（每 1 秒一次，20 字节，逆向自官方 APK）
@@ -38,6 +39,9 @@ final class CastEngine: ObservableObject {
     private var pingCounter: UInt32 = 0
     private var pingSentTimes: [UInt32: Int] = [:]
     private var duplicateKeyframes = true
+    /// 选了图片就用图片当画面源，没选就用测试图
+    private var photoImage: UIImage?
+    private var photoBuffer: CVPixelBuffer?
 
     private let frameQueue = DispatchQueue(label: "ninebotcast.frames")
     private let callbackQueue = DispatchQueue(label: "ninebotcast.send")
@@ -48,6 +52,23 @@ final class CastEngine: ObservableObject {
 
     init() {
         callbackQueue.setSpecific(key: queueKey, value: 1)
+    }
+
+    /// 选一张相册图片当画面源；传 nil 回到测试图
+    func setPhoto(_ image: UIImage?) {
+        photoImage = image
+        rebuildPhotoBuffer()
+    }
+
+    private func rebuildPhotoBuffer() {
+        guard let photoImage else {
+            photoBuffer = nil
+            Diag.log("画面源：测试图")
+            return
+        }
+        photoBuffer = PhotoSource.makePixelBuffer(
+            from: photoImage, width: preset.width, height: preset.height)
+        Diag.log("画面源：图片 \(Int(photoImage.size.width))x\(Int(photoImage.size.height)) → \(preset.width)x\(preset.height)")
     }
 
     /// - Parameter pingOnly: 只发 RTCP ping，不建编码器、不发视频。用于隔离闪退原因。
@@ -81,6 +102,7 @@ final class CastEngine: ObservableObject {
         encodedFrameIndex = 0
         pingCounter = 0
         pingSentTimes = [:]
+        rebuildPhotoBuffer()   // 预设变了，图片要按新尺寸重画
 
         let localIP = LocalAddress.primaryIPv4()
         localIPText = localIP ?? "（没取到 Wi-Fi 地址）"
@@ -229,6 +251,13 @@ final class CastEngine: ObservableObject {
     private func produceFrame() {
         autoreleasepool {
             guard let encoder else { return }
+            // 有图片就发图片（每帧重复编码同一张），否则发测试图
+            if let photoBuffer {
+                frameIndex &+= 1
+                encoder.encode(photoBuffer,
+                               presentationTime: CMTime(value: frameIndex, timescale: preset.fps))
+                return
+            }
             guard let pixelBuffer = TestImageSource.makeFrame(
                 index: frameIndex,
                 width: preset.width,

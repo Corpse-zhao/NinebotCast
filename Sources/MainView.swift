@@ -1,4 +1,6 @@
 import SwiftUI
+import PhotosUI
+import UIKit
 
 enum AppVersion {
     static var short: String {
@@ -24,6 +26,8 @@ struct MainView: View {
     @State private var scanSummary = ""
     @State private var diagText = Diag.tail(16)
     @State private var localIP = "-"
+    @State private var pickedItem: PhotosPickerItem?
+    @State private var pickedImage: UIImage?
 
     var body: some View {
         NavigationStack {
@@ -55,6 +59,35 @@ struct MainView: View {
                         .font(.footnote)
                         .foregroundColor(.secondary)
                     Text("关键前提：仪表必须已由九号自己的巡航逻辑进入投屏接收态（官方 App 车辆页 → 仪表投屏导航 → 投屏导航，等仪表出地图）。然后**从后台强退九号出行**（上滑划掉）——它活着就会占住本机 5012/5013 端口并持续心跳，我们的包根本发不出去（状态里出现「端口被占」就是这种情况）。iPhone 连上仪表热点后，IP 填热点详情页「路由器」那行，别填本机地址。")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                }
+
+                Section("画面来源") {
+                    PhotosPicker(selection: $pickedItem, matching: .images) {
+                        Label(pickedImage == nil ? "选择图片投屏" : "更换图片",
+                              systemImage: "photo.on.rectangle.angled")
+                    }
+                    if let pickedImage {
+                        HStack(spacing: 12) {
+                            Image(uiImage: pickedImage)
+                                .resizable()
+                                .scaledToFill()
+                                .frame(width: 72, height: 48)
+                                .clipped()
+                                .cornerRadius(6)
+                            Text("\(Int(pickedImage.size.width))×\(Int(pickedImage.size.height))，将按预设分辨率等比缩放")
+                                .font(.footnote)
+                                .foregroundColor(.secondary)
+                            Spacer()
+                        }
+                        Button("清除图片（回到测试图）", role: .destructive) {
+                            self.pickedImage = nil
+                            self.pickedItem = nil
+                            engine.setPhoto(nil)
+                        }
+                    }
+                    Text("没选图片时发内置测试图（彩条 + 绿滑块 + 帧号）。图片是静态的，会按帧率持续重发，仪表上看到的是一张定住的图。视频和摄像头投屏放下一版。")
                         .font(.footnote)
                         .foregroundColor(.secondary)
                 }
@@ -170,6 +203,17 @@ struct MainView: View {
                 localIP = LanScanner.localIPv4() ?? "未连 Wi-Fi"
                 diagText = Diag.tail(16)
                 Diag.log("MainView 出现，版本 \(AppVersion.display)")
+            }
+            .onChange(of: pickedItem) { item in
+                guard let item else { return }
+                Task {
+                    guard let data = try? await item.loadTransferable(type: Data.self),
+                          let image = UIImage(data: data) else { return }
+                    await MainActor.run {
+                        pickedImage = image
+                        engine.setPhoto(image)
+                    }
+                }
             }
         }
     }

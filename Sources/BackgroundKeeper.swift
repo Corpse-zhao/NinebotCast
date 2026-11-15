@@ -29,6 +29,10 @@ final class BackgroundKeeper {
             try session.setActive(true)
 
             let format = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 2)
+            guard let format else {
+                Diag.log("后台保活：音频格式创建失败，退后台会断流")
+                return
+            }
             let src = AVAudioSourceNode(format: format) { _, _, _, audioBufferList -> OSStatus in
                 // 输出全零 = 静音；目的只是让音频会话保持活跃
                 let buffers = UnsafeMutableAudioBufferListPointer(audioBufferList)
