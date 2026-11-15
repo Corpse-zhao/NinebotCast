@@ -1,0 +1,8 @@
+name: sanity test
+on:
+  workflow_dispatch:
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hello && sw_vers 2>/dev/null || uname -a
