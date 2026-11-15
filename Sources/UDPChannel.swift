@@ -32,8 +32,7 @@ final class UDPChannel {
         self.remotePort = NWEndpoint.Port(rawValue: remotePort) ?? 5012
         self.localIP = localIP
         self.localPort = localPort
-        self.wantLocalBind = (localIP != nil && localPort != nil &&
-                              NWEndpoint.Port(rawValue: localPort) != nil)
+        self.wantLocalBind = (localIP != nil && localPort != nil)
     }
 
     func start() {
