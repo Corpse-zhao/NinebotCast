@@ -14,6 +14,7 @@ final class CastEngine: ObservableObject {
     @Published var sentPackets: Int = 0
     @Published var rtcpPongCount: Int = 0
     @Published var lastRTTMs: Int = -1
+    @Published var dashboardReport: String = ""
 
     private var preset: DashboardPreset = .fiveInch
     private var videoChannel: UDPChannel?
@@ -195,8 +196,28 @@ final class CastEngine: ObservableObject {
                     self.lastRTTMs = Int(Date().timeIntervalSince1970 * 1000) - sentAt
                 }
             }
+            return
         }
-        // 其他回包（如官方 24 字节变体）只记日志
+        // 仪表主动报告：1=丢包 2=请求帧率 3=请求码率
+        if let report = RTCP.parseApp(data) {
+            DispatchQueue.main.async {
+                switch report.subtype {
+                case 1:
+                    self.dashboardReport = "仪表丢包报告 #\(report.value ?? 0)"
+                case 2:
+                    self.dashboardReport = "仪表请求帧率 \(report.value ?? 0) FPS"
+                case 3:
+                    if let rate = report.value {
+                        self.dashboardReport = "仪表请求码率 \(rate / 1000) kbps（已应用）"
+                        self.encoder?.updateBitrate(rate)
+                    }
+                default:
+                    break
+                }
+            }
+            return
+        }
+        // 其他回包只记日志
         if data.count != 20 {
             NSLog("仪表回包 \(data.count) 字节: %@", data.map { String(format: "%02x", $0) }.joined())
         }

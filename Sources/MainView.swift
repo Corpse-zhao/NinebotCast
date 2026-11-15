@@ -19,7 +19,7 @@ struct MainView: View {
                         .keyboardType(.decimalPad)
                         .autocorrectionDisabled()
                     Toggle("关键帧重发", isOn: $duplicateKeyframes)
-                    Text("先在仪表菜单里开启投屏模式（不用进导航）。iPhone 在 设置 > Wi-Fi 连上仪表热点后，把这里填成热点详情页里「路由器」那行的地址。")
+                    Text("先在仪表或官方 App 的巡航投屏里让仪表进入投屏状态（官方是点车辆页巡航入口）。iPhone 在 设置 > Wi-Fi 连上仪表热点后，把这里填成热点详情页里「路由器」那行的地址。")
                         .font(.footnote)
                         .foregroundColor(.secondary)
                 }
@@ -48,6 +48,11 @@ struct MainView: View {
                          : "RTCP 尚无回应（等 2 秒以上）")
                         .monospacedDigit()
                         .foregroundColor(engine.rtcpPongCount > 0 ? .green : .secondary)
+                    if !engine.dashboardReport.isEmpty {
+                        Text(engine.dashboardReport)
+                            .font(.footnote)
+                            .foregroundColor(.blue)
+                    }
                 }
 
                 Section("协议要点（逆向自官方 APK）") {

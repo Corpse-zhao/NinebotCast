@@ -61,8 +61,7 @@ final class H264Encoder {
         return true
     }
 
-    func encode(_ pixelBuffer: CVPixelBuffer, presentationTime: CMTime) {
-        guard let session else { return }
+    func encode(_ pixelBuffer: CVPixelBuffer, presentationTime: CMTime) {        guard let session else { return }
         VTCompressionSessionEncodeFrame(
             session,
             imageBuffer: pixelBuffer,
@@ -71,6 +70,13 @@ final class H264Encoder {
             frameProperties: nil,
             sourceFrameRefcon: nil,
             infoFlagsOut: nil)
+    }
+
+    /// 仪表通过 RTCP APP 子类型 3 请求改码率时调用
+    func updateBitrate(_ bitrate: UInt32) {
+        guard let session, bitrate >= 200_000, bitrate <= 8_000_000 else { return }
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate,
+                             value: NSNumber(value: bitrate))
     }
 
     func teardown() {

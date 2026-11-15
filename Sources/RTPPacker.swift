@@ -78,6 +78,25 @@ enum RTCP {
         else { return nil }
         return UInt32(b[12]) | (UInt32(b[13]) << 8) | (UInt32(b[14]) << 16) | (UInt32(b[15]) << 24)
     }
+
+    /// 仪表主动发来的 RTCP APP 报告（逆向自 NinebotEnhance 文档）：
+    /// 子类型 1 = 丢包报告；2 = 请求帧率；3 = 请求码率（数值为小端 32 位，位于 [12..15]）
+    struct AppReport {
+        let subtype: Int
+        let value: UInt32?
+    }
+
+    static func parseApp(_ data: Data) -> AppReport? {
+        let b = [UInt8](data)
+        guard b.count >= 8, (b[0] >> 6) == 2, b[1] == 0xCC else { return nil }
+        let subtype = Int(b[0] & 0x1F)
+        guard subtype == 1 || subtype == 2 || subtype == 3 else { return nil }
+        var value: UInt32?
+        if b.count >= 16 {
+            value = UInt32(b[12]) | (UInt32(b[13]) << 8) | (UInt32(b[14]) << 16) | (UInt32(b[15]) << 24)
+        }
+        return AppReport(subtype: subtype, value: value)
+    }
 }
 
 /// 本机 Wi-Fi IPv4（用于把本地端口绑到 5012/5013，与官方实现一致）
