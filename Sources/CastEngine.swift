@@ -168,6 +168,7 @@ final class CastEngine: ObservableObject {
             ? "仅 RTCP ping → \(target):5013（不编码、不发画面）"
             : "发送中 → \(target):5012\(localIP.map { "（本机 \($0)）" } ?? "")：\(preset.title)"
         isRunning = true
+        BackgroundKeeper.shared.start()   // 退后台不断流（静音音频保活 + 禁止锁屏）
         Diag.log("start 完成")
     }
 
@@ -192,6 +193,7 @@ final class CastEngine: ObservableObject {
 
         videoChannel?.stop(); videoChannel = nil
         controlChannel?.stop(); controlChannel = nil
+        BackgroundKeeper.shared.stop()
 
         if statusText.hasPrefix("发送中") || statusText.hasPrefix("仅 RTCP") {
             statusText = "已停止"
