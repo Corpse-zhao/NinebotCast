@@ -3,21 +3,32 @@ import CoreVideo
 import CoreMedia
 import VideoToolbox
 
-/// VideoToolbox H.264 硬编码器，输出 Annex-B 流（关键帧前自带 SPS/PPS）
+/// VideoToolbox H.264 硬编码器，输出 Annex-B 流（每帧前自带 SPS/PPS）
+///
+/// 本版为「防闪退」加固版，重点修两个真实隐患：
+/// 1. `CMBlockBufferGetDataPointer` 拿到的指针不一定覆盖整帧（块缓冲可能不连续），
+///    按 totalLength 强行读会越界崩溃 —— 改为 `CMBlockBufferCopyDataBytes` 拷贝。
+/// 2. refcon 里存的是未持有的 self，若编码器对象先被释放、VT 回调后到，
+///    就是 use-after-free。现在由 CastEngine 负责保活（退役实例不释放），
+///    并在 teardown 时先 CompleteFrames 再 Invalidate。
 final class H264Encoder {
     /// (annexB 数据, 是否关键帧)
     var onAnnexBFrame: ((Data, Bool) -> Void)?
 
     private var session: VTCompressionSession?
-    private var formatDescription: CMVideoFormatDescription?
     private var parameterSets: Data?
-    private let callbackQueue = DispatchQueue(label: "ninebotcast.vt")
+    private var isTornDown = true
+    private var encodedCount = 0
 
     func setup(width: Int, height: Int, fps: Int32, bitrate: UInt32) -> Bool {
         teardown()
+        guard width > 0, height > 0, fps > 0 else {
+            Diag.log("VT setup 参数非法 \(width)x\(height) fps=\(fps)")
+            return false
+        }
+        isTornDown = false
+        encodedCount = 0
 
-        // 编码器规格留空：iOS 系统默认优先使用硬件编码器
-        // （EnableHardwareAcceleratedVideoEncoder 键要求 iOS 17.4+，不用它以兼容低版本）
         var sessionOut: VTCompressionSession?
         let status = VTCompressionSessionCreate(
             allocator: kCFAllocatorDefault,
@@ -28,20 +39,21 @@ final class H264Encoder {
             imageBufferAttributes: nil,
             compressedDataAllocator: kCFAllocatorDefault,
             outputCallback: { refcon, _, status, _, sampleBuffer in
-                guard status == noErr, let sampleBuffer else { return }
-                guard let refcon else { return }
+                guard status == noErr, let sampleBuffer, let refcon else { return }
                 let encoder = Unmanaged<H264Encoder>.fromOpaque(refcon).takeUnretainedValue()
+                guard !encoder.isTornDown else { return }
                 encoder.handleOutput(sampleBuffer: sampleBuffer)
             },
             refcon: Unmanaged.passUnretained(self).toOpaque(),
             compressionSessionOut: &sessionOut)
 
         guard status == noErr, let session = sessionOut else {
-            NSLog("VTCompressionSessionCreate failed: \(status)")
+            Diag.log("VTCompressionSessionCreate 失败 status=\(status)")
             return false
         }
 
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_RealTime,
+                             value: kCFBooleanTrue)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel,
                              value: kVTProfileLevel_H264_Main_AutoLevel)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate,
@@ -49,42 +61,51 @@ final class H264Encoder {
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate,
                              value: NSNumber(value: Int(fps)))
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval,
-                             value: NSNumber(value: Int(fps))) // 每秒 1 个关键帧，与官方一致
+                             value: NSNumber(value: Int(fps))) // 每秒 1 个关键帧
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering,
                              value: kCFBooleanFalse)
 
         guard VTCompressionSessionPrepareToEncodeFrames(session) == noErr else {
-            NSLog("VTCompressionSessionPrepareToEncodeFrames failed")
+            Diag.log("VTCompressionSessionPrepareToEncodeFrames 失败")
+            VTCompressionSessionInvalidate(session)
             return false
         }
         self.session = session
+        Diag.log("VT 编码器就绪 \(width)x\(height) fps=\(fps) \(bitrate / 1000)kbps")
         return true
     }
 
-    func encode(_ pixelBuffer: CVPixelBuffer, presentationTime: CMTime) {        guard let session else { return }
-        VTCompressionSessionEncodeFrame(
+    func encode(_ pixelBuffer: CVPixelBuffer, presentationTime: CMTime) {
+        guard let session, !isTornDown else { return }
+        let status = VTCompressionSessionEncodeFrame(
             session,
             imageBuffer: pixelBuffer,
             presentationTimeStamp: presentationTime,
-            duration: CMTime.invalid,
+            duration: .invalid,
             frameProperties: nil,
             sourceFrameRefcon: nil,
             infoFlagsOut: nil)
+        if status != noErr && status != kVTVideoEncoderMalfunctionErr {
+            Diag.log("VT encode 返回 \(status)")
+        }
     }
 
     /// 仪表通过 RTCP APP 子类型 3 请求改码率时调用
     func updateBitrate(_ bitrate: UInt32) {
-        guard let session, bitrate >= 200_000, bitrate <= 8_000_000 else { return }
+        guard let session, !isTornDown,
+              bitrate >= 200_000, bitrate <= 8_000_000 else { return }
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate,
                              value: NSNumber(value: bitrate))
     }
 
     func teardown() {
+        isTornDown = true
         if let session {
+            // 先把在飞的帧全部编码完，再失效，避免回调打到已失效会话上
+            VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
             VTCompressionSessionInvalidate(session)
         }
         session = nil
-        formatDescription = nil
         parameterSets = nil
     }
 
@@ -93,36 +114,42 @@ final class H264Encoder {
     }
 
     private func handleOutput(sampleBuffer: CMSampleBuffer) {
-        if let desc = CMSampleBufferGetFormatDescription(sampleBuffer),
-           desc !== formatDescription {
-            formatDescription = desc
+        if let desc = CMSampleBufferGetFormatDescription(sampleBuffer) {
             parameterSets = Self.parameterSets(from: desc)
         }
 
         var isKeyFrame = true
-        if let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false)
-            as? [[CFString: Any]],
-           let notSync = attachments.first?[kCMSampleAttachmentKey_NotSync] as? Bool {
+        if let attachments = CMSampleBufferGetSampleAttachmentsArray(
+            sampleBuffer, createIfNecessary: false) as? [[String: Any]],
+           let notSync = attachments.first?[kCMSampleAttachmentKey_NotSync as String] as? Bool {
             isKeyFrame = !notSync
         }
 
         guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
-        var totalLength = 0
-        var dataPointer: UnsafeMutablePointer<Int8>?
-        CMBlockBufferGetDataPointer(
-            blockBuffer,
-            atOffset: 0,
-            lengthAtOffsetOut: nil,
-            totalLengthOut: &totalLength,
-            dataPointerOut: &dataPointer)
-        guard let pointer = dataPointer, totalLength > 0 else { return }
+        let totalLength = CMBlockBufferGetDataLength(blockBuffer)
+        guard totalLength > 0 else { return }
+
+        // 不依赖「块缓冲一定连续」：整段拷出来，天然没有越界风险
+        var raw = Data(count: totalLength)
+        let copyStatus: OSStatus = raw.withUnsafeMutableBytes { rawBuffer -> OSStatus in
+            guard let base = rawBuffer.baseAddress else { return -1 }
+            return CMBlockBufferCopyDataBytes(
+                blockBuffer, atOffset: 0, dataLength: totalLength, destination: base)
+        }
+        guard copyStatus == noErr else {
+            Diag.log("CMBlockBufferCopyDataBytes 失败 \(copyStatus)")
+            return
+        }
 
         var annexB = Data()
-        // 官方实现：每一帧前面都拼上 SPS/PPS（不只是关键帧）
-        if let ps = parameterSets {
-            annexB.append(ps)
+        if let ps = parameterSets { annexB.append(ps) }
+        annexB.append(Self.avccToAnnexB(raw))
+        guard annexB.count > 4 else { return }
+
+        encodedCount += 1
+        if encodedCount == 1 {
+            Diag.log("VT 首帧 编码完成 \(annexB.count) 字节 key=\(isKeyFrame)")
         }
-        annexB.append(Self.avccToAnnexB(Data(bytes: UnsafeRawPointer(pointer), count: totalLength)))
         onAnnexBFrame?(annexB, isKeyFrame)
     }
 

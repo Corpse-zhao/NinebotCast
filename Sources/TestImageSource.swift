@@ -1,9 +1,17 @@
-import UIKit
+import Foundation
 import CoreVideo
+import CoreGraphics
+import CoreText
 
-/// 测试图帧生成器：色条 + 移动滑块 + 帧计数文字，用于验证仪表能否出画面
+/// 测试图帧生成器：色条 + 移动滑块 + 帧计数文字。
+///
+/// 这个函数跑在后台队列上（20 帧/秒），所以**完全不用 UIKit**：
+/// 颜色用 CGColor 直接构造，文字用 CoreText + CTFont，避免在非主线程碰 UIKit 静态状态。
+/// 这也是上一版潜在闪退点之一。
 enum TestImageSource {
     static func makeFrame(index: Int64, width: Int, height: Int) -> CVPixelBuffer? {
+        guard width > 16, height > 16 else { return nil }
+
         var buffer: CVPixelBuffer?
         let attrs: [CFString: Any] = [
             kCVPixelBufferCGImageCompatibilityKey: true,
@@ -29,33 +37,47 @@ enum TestImageSource {
 
         let w = CGFloat(width), h = CGFloat(height)
 
-        // 黑底
-        context.setFillColor(UIColor.black.cgColor)
+        context.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
         context.fill(CGRect(x: 0, y: 0, width: w, height: h))
 
-        // 色条（上半部）
-        let colors: [UIColor] = [.white, .yellow, .cyan, .green, .magenta, .red, .blue, .black]
+        // 彩条
+        let colors: [CGColor] = [
+            CGColor(red: 1, green: 1, blue: 1, alpha: 1),
+            CGColor(red: 1, green: 1, blue: 0, alpha: 1),
+            CGColor(red: 0, green: 1, blue: 1, alpha: 1),
+            CGColor(red: 0, green: 1, blue: 0, alpha: 1),
+            CGColor(red: 1, green: 0, blue: 1, alpha: 1),
+            CGColor(red: 1, green: 0, blue: 0, alpha: 1),
+            CGColor(red: 0, green: 0, blue: 1, alpha: 1),
+            CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+        ]
         let barWidth = w / CGFloat(colors.count)
         for (i, color) in colors.enumerated() {
-            context.setFillColor(color.cgColor)
-            context.fill(CGRect(x: CGFloat(i) * barWidth, y: h * 0.45, width: barWidth, height: h * 0.2))
+            context.setFillColor(color)
+            context.fill(CGRect(x: CGFloat(i) * barWidth, y: h * 0.45,
+                                width: barWidth, height: h * 0.2))
         }
 
         // 移动滑块（证明画面在动）
-        let sliderX = CGFloat(Int(index) % Int(max(1, Int(w) - 80)))
-        context.setFillColor(UIColor.systemGreen.cgColor)
+        let travel = max(1, width - 80)
+        let sliderX = CGFloat(Int(index % Int64(travel)))
+        context.setFillColor(CGColor(red: 0.2, green: 0.9, blue: 0.3, alpha: 1))
         context.fill(CGRect(x: sliderX, y: h * 0.72, width: 80, height: h * 0.12))
 
         // 帧计数
-        let text = "NINEBOT CAST  #\(index)"
-        let attrs2: [NSAttributedString.Key: Any] = [
-            .font: UIFont.boldSystemFont(ofSize: max(18, h * 0.09)),
-            .foregroundColor: UIColor.white
+        let text = "NINEBOT CAST #\(index)"
+        let fontSize = max(18, h * 0.09)
+        let font = CTFontCreateWithName("Helvetica-Bold" as CFString, fontSize, nil)
+        let textAttrs: [CFString: Any] = [
+            kCTFontAttributeName: font,
+            kCTForegroundColorAttributeName: CGColor(red: 1, green: 1, blue: 1, alpha: 1)
         ]
-        let attributed = NSAttributedString(string: text, attributes: attrs2)
-        let line = CTLineCreateWithAttributedString(attributed)
-        context.textPosition = CGPoint(x: 16, y: h - h * 0.18)
-        CTLineDraw(line, context)
+        if let attributed = CFAttributedStringCreate(
+            kCFAllocatorDefault, text as CFString, textAttrs as CFDictionary) {
+            let line = CTLineCreateWithAttributedString(attributed)
+            context.textPosition = CGPoint(x: 16, y: h * 0.18)
+            CTLineDraw(line, context)
+        }
 
         return pixelBuffer
     }

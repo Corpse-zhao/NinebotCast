@@ -10,7 +10,8 @@ final class KCPChannel {
     init(conv: UInt32, output: @escaping (Data) -> Void) {
         self.output = output
         guard let created = ikcp_create(conv, Unmanaged.passUnretained(self).toOpaque()) else {
-            fatalError("ikcp_create failed")
+            Diag.log("ikcp_create 失败，KCP 通道降级为不发送")
+            return
         }
         kcp = created
         ikcp_setoutput(created) { buffer, length, _, user in

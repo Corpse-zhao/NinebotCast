@@ -11,9 +11,8 @@ final class UDPChannel {
     var onReceive: ((Data) -> Void)?
 
     init(host: String, remotePort: UInt16, localIP: String? = nil, localPort: UInt16? = nil) {
-        guard let portValue = NWEndpoint.Port(rawValue: remotePort) else {
-            fatalError("非法端口 \(remotePort)")
-        }
+        // 端口非法时退回默认值，不用 fatalError（宁可发不出去也不要闪退）
+        let portValue = NWEndpoint.Port(rawValue: remotePort) ?? 5012
         let params = NWParameters.udp
         if let localIP, let localPort, let lp = NWEndpoint.Port(rawValue: localPort) {
             params.requiredLocalEndpoint = NWEndpoint.hostPort(
@@ -27,8 +26,15 @@ final class UDPChannel {
 
     func start() {
         connection.stateUpdateHandler = { [weak self] state in
-            if case .ready = state {
+            switch state {
+            case .ready:
                 self?.receiveLoop()
+            case .failed(let error):
+                Diag.log("UDP 失败 \(error)")
+            case .waiting(let error):
+                Diag.log("UDP 等待 \(error)")
+            default:
+                break
             }
         }
         connection.start(queue: queue)
