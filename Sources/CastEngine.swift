@@ -185,7 +185,7 @@ final class CastEngine: ObservableObject {
 
     private func handleControlReceive(_ data: Data) {
         if let seq = RTCP.parsePong(data) {
-            var sentAt: Int64? = nil
+            var sentAt: Int? = nil
             callbackQueue.sync {
                 sentAt = pingSentTimes.removeValue(forKey: seq)
             }
