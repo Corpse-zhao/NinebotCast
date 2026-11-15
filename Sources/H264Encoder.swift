@@ -49,7 +49,7 @@ final class H264Encoder {
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate,
                              value: NSNumber(value: Int(fps)))
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval,
-                             value: NSNumber(value: Int(fps * 2)))
+                             value: NSNumber(value: Int(fps))) // 每秒 1 个关键帧，与官方一致
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering,
                              value: kCFBooleanFalse)
 
@@ -112,7 +112,8 @@ final class H264Encoder {
         guard let pointer = dataPointer, totalLength > 0 else { return }
 
         var annexB = Data()
-        if isKeyFrame, let ps = parameterSets {
+        // 官方实现：每一帧前面都拼上 SPS/PPS（不只是关键帧）
+        if let ps = parameterSets {
             annexB.append(ps)
         }
         annexB.append(Self.avccToAnnexB(Data(bytes: UnsafeRawPointer(pointer), count: totalLength)))

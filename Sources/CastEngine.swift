@@ -2,11 +2,18 @@ import Foundation
 import CoreMedia
 
 /// 投屏引擎：帧定时器 → 测试图 → VideoToolbox → RTP 打包 → UDP 5012
-/// 控制与保活 → UDP 5013（心跳字节格式待抓包核对，骨架阶段先发占位包）
+/// RTCP ping/pong → UDP 5013（每 1 秒一次，20 字节，协议逆向自官方 APK）
+///
+/// 与官方 Android 实现对齐的关键点：
+/// - 每帧数据 = SPS/PPS(Annex-B) + 帧数据(Annex-B)，逐字节 1380 分片
+/// - 时间戳用毫秒；关键帧每秒 1 个；关键帧可选重发一遍
+/// - 本地端口绑定 5012/5013
 final class CastEngine: ObservableObject {
     @Published var statusText: String = "待机"
     @Published var sentFrames: Int = 0
     @Published var sentPackets: Int = 0
+    @Published var rtcpPongCount: Int = 0
+    @Published var lastRTTMs: Int = -1
 
     private var preset: DashboardPreset = .fiveInch
     private var videoChannel: UDPChannel?
@@ -15,8 +22,11 @@ final class CastEngine: ObservableObject {
     private var kcpChannel: KCPChannel?
     private var kcpTimer: DispatchSourceTimer?
     private var frameTimer: DispatchSourceTimer?
-    private var heartbeatTimer: DispatchSourceTimer?
+    private var pingTimer: DispatchSourceTimer?
     private var frameIndex: Int64 = 0
+    private var pingCounter: UInt32 = 0
+    private var pingSentTimes: [UInt32: Int64] = [:]
+    private var duplicateKeyframes = true
 
     private let frameQueue = DispatchQueue(label: "ninebotcast.frames")
     private let callbackQueue = DispatchQueue(label: "ninebotcast.send")
@@ -26,7 +36,7 @@ final class CastEngine: ObservableObject {
 
     var isRunning: Bool { frameTimer != nil }
 
-    func start(preset: DashboardPreset, host: String) {
+    func start(preset: DashboardPreset, host: String, duplicateKeyframes: Bool) {
         guard preset.isImplemented else {
             statusText = "该预设未实现（JPEG 模式待开发）"
             return
@@ -34,13 +44,18 @@ final class CastEngine: ObservableObject {
         stop()
 
         self.preset = preset
+        self.duplicateKeyframes = duplicateKeyframes
         frameIndex = 0
+        pingCounter = 0
+        pingSentTimes = [:]
 
-        let video = UDPChannel(host: host, port: 5012)
+        let localIP = LocalAddress.primaryIPv4()
+
+        let video = UDPChannel(host: host, remotePort: 5012, localIP: localIP, localPort: 5012)
         video.start()
         videoChannel = video
 
-        let control = UDPChannel(host: host, port: 5013)
+        let control = UDPChannel(host: host, remotePort: 5013, localIP: localIP, localPort: 5013)
         control.start()
         controlChannel = control
 
@@ -57,12 +72,12 @@ final class CastEngine: ObservableObject {
             kcpTimer = timer
         }
 
-        // 仪表回包（控制回应 / KCP ACK）
-        video.onReceive = { [weak self] data in
-            self?.handleReceive(data)
-        }
+        // 仪表回包：RTCP pong（官方还有 24 字节回复变体，仅记录）
         control.onReceive = { [weak self] data in
-            self?.handleReceive(data)
+            self?.handleControlReceive(data)
+        }
+        video.onReceive = { [weak self] data in
+            self?.handleControlReceive(data)
         }
 
         let encoder = H264Encoder()
@@ -72,23 +87,23 @@ final class CastEngine: ObservableObject {
             statusText = "H.264 编码器初始化失败"
             return
         }
-        encoder.onAnnexBFrame = { [weak self] data, _ in
-            self?.handleEncodedFrame(data)
+        encoder.onAnnexBFrame = { [weak self] data, isKey in
+            self?.handleEncodedFrame(data, keyframe: isKey)
         }
         self.encoder = encoder
 
         callbackQueue.sync {
-            packer = RTPPacker(payloadType: preset.rtpPayloadType)
+            packer = RTPPacker()
         }
 
-        // 心跳/控制：字节格式待抓包核对，先发 1 字节占位
-        let heartbeat = DispatchSource.makeTimerSource(queue: callbackQueue)
-        heartbeat.schedule(deadline: .now(), repeating: .milliseconds(500))
-        heartbeat.setEventHandler { [weak self] in
-            self?.controlChannel?.send(Data([0x00]))
+        // RTCP ping：每 1 秒一次（官方节奏），计数器从 1 开始
+        let ping = DispatchSource.makeTimerSource(queue: callbackQueue)
+        ping.schedule(deadline: .now() + 0.5, repeating: .seconds(1))
+        ping.setEventHandler { [weak self] in
+            self?.sendPing()
         }
-        heartbeat.resume()
-        heartbeatTimer = heartbeat
+        ping.resume()
+        pingTimer = ping
 
         // 帧定时器
         let timer = DispatchSource.makeTimerSource(queue: frameQueue)
@@ -97,14 +112,16 @@ final class CastEngine: ObservableObject {
         timer.resume()
         frameTimer = timer
 
-        statusText = "发送中 → \(host)：\(preset.title)，请看仪表画面"
+        statusText = "发送中 → \(host)\(localIP.map { "（本机 \($0):5012/5013）" } ?? "")：\(preset.title)"
         sentFrames = 0
         sentPackets = 0
+        rtcpPongCount = 0
+        lastRTTMs = -1
     }
 
     func stop() {
         frameTimer?.cancel(); frameTimer = nil
-        heartbeatTimer?.cancel(); heartbeatTimer = nil
+        pingTimer?.cancel(); pingTimer = nil
         kcpTimer?.cancel(); kcpTimer = nil
         callbackQueue.sync { packer = nil }
         kcpChannel = nil
@@ -112,9 +129,21 @@ final class CastEngine: ObservableObject {
         encoder = nil
         videoChannel?.stop(); videoChannel = nil
         controlChannel?.stop(); controlChannel = nil
-        if isRunning || statusText.hasPrefix("发送中") {
+        if statusText.hasPrefix("发送中") {
             statusText = "已停止"
         }
+    }
+
+    private func sendPing() {
+        pingCounter &+= 1
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        callbackQueue.sync {
+            pingSentTimes[pingCounter] = now
+            if pingSentTimes.count > 16 {
+                pingSentTimes.removeValue(forKey: pingSentTimes.keys.first!)
+            }
+        }
+        controlChannel?.send(RTCP.ping(counter: pingCounter))
     }
 
     private func produceFrame() {
@@ -128,29 +157,48 @@ final class CastEngine: ObservableObject {
         encoder.encode(pixelBuffer, presentationTime: time)
     }
 
-    private func handleEncodedFrame(_ annexB: Data) {
+    private func handleEncodedFrame(_ annexB: Data, keyframe: Bool) {
         callbackQueue.sync {
-            guard packer != nil else { return }
-            let nalus = AnnexB.split(annexB)
-            guard !nalus.isEmpty else { return }
-            let packets = packer!.packetizeFrame(nalus: nalus, fps: preset.fps)
+            guard let selfPacker = packer else { return }
+            guard !annexB.isEmpty else { return }
 
-            if let kcp = kcpChannel {
-                for packet in packets { kcp.send(packet) }
-            } else {
-                for packet in packets { videoChannel?.send(packet) }
+            // 时间戳：毫秒（帧序号 × 1000 / fps）
+            let timestampMs = UInt32((frameIndex * 1000) / Int64(preset.fps))
+            let packets = selfPacker.packetizeFrame(annexB, timestampMs: timestampMs, isKeyframe: keyframe)
+            let copies = (keyframe && duplicateKeyframes) ? 2 : 1
+            for _ in 0..<copies {
+                for packet in packets {
+                    if let kcp = kcpChannel {
+                        kcp.send(packet)
+                    } else {
+                        videoChannel?.send(packet)
+                    }
+                }
             }
 
             DispatchQueue.main.async {
                 self.sentFrames += 1
-                self.sentPackets += packets.count
+                self.sentPackets += packets.count * copies
             }
         }
     }
 
-    private func handleReceive(_ data: Data) {
-        // TODO: 抓包核对 5013 回应（README 提到七寸有 24 字节回复）
-        kcpChannel?.input(data)
-        NSLog("仪表回包 \(data.count) 字节: %@", data.map { String(format: "%02x", $0) }.joined())
+    private func handleControlReceive(_ data: Data) {
+        if let seq = RTCP.parsePong(data) {
+            var sentAt: Int64? = nil
+            callbackQueue.sync {
+                sentAt = pingSentTimes.removeValue(forKey: seq)
+            }
+            DispatchQueue.main.async {
+                self.rtcpPongCount += 1
+                if let sentAt {
+                    self.lastRTTMs = Int(Date().timeIntervalSince1970 * 1000) - sentAt
+                }
+            }
+        }
+        // 其他回包（如官方 24 字节变体）只记日志
+        if data.count != 20 {
+            NSLog("仪表回包 \(data.count) 字节: %@", data.map { String(format: "%02x", $0) }.joined())
+        }
     }
 }

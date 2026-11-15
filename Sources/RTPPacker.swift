@@ -1,115 +1,111 @@
 import Foundation
 
-/// 标准 RTP (RFC 3550) + H.264 FU-A 分片 (RFC 6184)。
-/// 注意：payload type / 时钟 / SSRC 等字段需要在拿到仪表真实抓包后核对，
-/// 当前按最通用的 96 / 90kHz 处理。
+/// 与 ninebot_pro Android APK 逆向出的仪表协议逐字节一致的 RTP 打包器。
+///
+/// 视频 RTP 包结构（共 20 字节头）：
+/// - [0]      0x90（V=2, X=1 扩展头）
+/// - [1]      (marker?0x80:0) | 32（payload type 固定 32）
+/// - [2..3]   序列号 BE16（全局逐包递增）
+/// - [4..7]   时间戳 BE32（单位：毫秒，帧间隔节奏）
+/// - [8..14]  0
+/// - [15]     1
+/// - [16]     0
+/// - [17]     标志：0x10=帧首包 0x08=帧尾包 0x01=关键帧
+/// - [18..19] BE16(1024 | (时间戳低10位))（帧级标识）
+/// - 负载：Annex-B 原始字节流按 1380 字节切块（不按 NALU 对齐）
 struct RTPPacker {
-    let payloadType: UInt8
-    let ssrc: UInt32
-    var maxPayloadSize: Int = 1200
-
+    let chunkSize = 1380
     private(set) var sequence: UInt16 = 0
-    private(set) var timestamp: UInt32 = 0
 
-    init(payloadType: UInt8 = 96, ssrc: UInt32 = 0x4E424354 /* "NBCT" */) {
-        self.payloadType = payloadType
-        self.ssrc = ssrc
-    }
-
-    /// 每个 packetizeFrame 调用内部推进一次时间戳（90kHz 时钟）。
-    mutating func packetizeFrame(nalus: [Data], fps: Int32) -> [Data] {
-        timestamp &+= UInt32(90_000 / max(1, Int(fps)))
-        var packets: [Data] = []
-        for (index, nalu) in nalus.enumerated() {
-            let marker = (index == nalus.count - 1)
-            packets.append(contentsOf: packetizeNalu(nalu, timestamp: timestamp, marker: marker))
-        }
-        return packets
-    }
-
-    private mutating func makeHeader(marker: Bool, timestamp ts: UInt32) -> Data {
-        sequence &+= 1
-        var h = Data(capacity: 12)
-        h.append(0x80) // V=2, P=0, X=0, CC=0
-        h.append((marker ? 0x80 : 0x00) | (payloadType & 0x7F))
-        h.append(UInt8(sequence >> 8))
-        h.append(UInt8(sequence & 0xFF))
-        for shift in [24, 16, 8, 0] {
-            h.append(UInt8((ts >> UInt32(shift)) & 0xFF))
-        }
-        for shift in [24, 16, 8, 0] {
-            h.append(UInt8((ssrc >> UInt32(shift)) & 0xFF))
-        }
-        return h
-    }
-
-    private mutating func packetizeNalu(_ nalu: Data, timestamp ts: UInt32, marker: Bool) -> [Data] {
-        let bytes = [UInt8](nalu)
+    mutating func packetizeFrame(_ frame: Data, timestampMs: UInt32, isKeyframe: Bool) -> [Data] {
+        let bytes = [UInt8](frame)
         guard !bytes.isEmpty else { return [] }
-
-        // 单包放得下：Single NAL Unit Mode
-        if bytes.count <= maxPayloadSize {
-            var packet = makeHeader(marker: marker, timestamp: ts)
-            packet.append(contentsOf: bytes)
-            return [packet]
-        }
-
-        // FU-A 分片
-        let nalHeader = bytes[0]
-        let nalType = nalHeader & 0x1F
-        let nalNri = nalHeader & 0x60
-        let fuIndicator = nalNri | 28 // FU-A
-        let payload = Array(bytes[1...])
-
         var packets: [Data] = []
         var offset = 0
-        while offset < payload.count {
-            let chunkLen = min(maxPayloadSize - 2, payload.count - offset)
+        while offset < bytes.count {
+            let chunkLen = min(chunkSize, bytes.count - offset)
             let isFirst = offset == 0
-            let isLast = offset + chunkLen >= payload.count
-            var fuHeader = UInt8(nalType)
-            if isFirst { fuHeader |= 0x80 }
-            if isLast { fuHeader |= 0x40 }
+            let isLast = offset + chunkLen >= bytes.count
+            sequence &+= 1
 
-            var packet = makeHeader(marker: isLast ? marker : false, timestamp: ts)
-            packet.append(fuIndicator)
-            packet.append(fuHeader)
-            packet.append(contentsOf: payload[offset..<offset + chunkLen])
+            var packet = Data(repeating: 0, count: 20 + chunkLen)
+            packet[0] = 0x90
+            packet[1] = (isLast ? 0x80 : 0x00) | 32
+            packet[2] = UInt8(sequence >> 8)
+            packet[3] = UInt8(sequence & 0xFF)
+            packet[4] = UInt8((timestampMs >> 24) & 0xFF)
+            packet[5] = UInt8((timestampMs >> 16) & 0xFF)
+            packet[6] = UInt8((timestampMs >> 8) & 0xFF)
+            packet[7] = UInt8(timestampMs & 0xFF)
+            // [8..14] 保持 0，[15] = 1，[16] = 0
+            packet[15] = 1
+            packet[17] = (isFirst ? 0x10 : 0x00) | (isKeyframe ? 0x01 : 0x00) | (isLast ? 0x08 : 0x00)
+            let frameTag = UInt16(1024 + Int(timestampMs & 1023))
+            packet[18] = UInt8(frameTag >> 8)
+            packet[19] = UInt8(frameTag & 0xFF)
+            packet.replaceSubrange(20..<20 + chunkLen, with: bytes[offset..<offset + chunkLen])
             packets.append(packet)
-            offset += chunkLen
+            offset += chunkSize
         }
         return packets
     }
 }
 
-/// 把 Annex-B（00 00 00 01 起始码）流拆成 NALU 列表
-enum AnnexB {
-    static func split(_ data: Data) -> [Data] {
-        let bytes = [UInt8](data)
-        var nalus: [Data] = []
-        var start: Int? = nil
-        var i = 0
-        while i + 2 < bytes.count {
-            if bytes[i] == 0 && bytes[i + 1] == 0 && bytes[i + 2] == 1 {
-                if let s = start, i > s {
-                    nalus.append(Data(bytes[s..<i]))
-                }
-                start = i + 3
-                i += 3
-            } else if bytes[i] == 0 && bytes[i + 1] == 0 && bytes[i + 2] == 0
-                        && i + 3 < bytes.count && bytes[i + 3] == 1 {
-                if let s = start, i > s {
-                    nalus.append(Data(bytes[s..<i]))
-                }
-                start = i + 4
-                i += 4
-            } else {
-                i += 1
+/// 5013 上的 RTCP 风格 ping/pong（逆向自 sd.h / sd.i）
+enum RTCP {
+    /// 20 字节 ping：85 CC 00 04 + 8 个 0 + 序号(LE32) + 02 00 00 00
+    static func ping(counter: UInt32) -> Data {
+        var d = Data(repeating: 0, count: 20)
+        d[0] = 0x85
+        d[1] = 0xCC
+        d[3] = 4
+        d[12] = UInt8(counter & 0xFF)
+        d[13] = UInt8((counter >> 8) & 0xFF)
+        d[14] = UInt8((counter >> 16) & 0xFF)
+        d[15] = UInt8((counter >> 24) & 0xFF)
+        d[16] = 2
+        return d
+    }
+
+    /// 校验 20 字节 pong 并取出序号；格式不符返回 nil
+    static func parsePong(_ data: Data) -> UInt32? {
+        let b = [UInt8](data)
+        guard b.count == 20,
+              b[0] == 0x85, b[1] == 0xCC, b[2] == 0, b[3] == 4,
+              b[4] == 0, b[5] == 0, b[6] == 0, b[7] == 1,
+              b[8] == 0, b[9] == 0, b[10] == 0, b[11] == 0,
+              b[16] == 2, b[17] == 0, b[18] == 0, b[19] == 0
+        else { return nil }
+        return UInt32(b[12]) | (UInt32(b[13]) << 8) | (UInt32(b[14]) << 16) | (UInt32(b[15]) << 24)
+    }
+}
+
+/// 本机 Wi-Fi IPv4（用于把本地端口绑到 5012/5013，与官方实现一致）
+enum LocalAddress {
+    static func primaryIPv4(preferInterfaces: Set<String> = ["en0"]) -> String? {
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return nil }
+        defer { freeifaddrs(first) }
+
+        var preferred: String?
+        var fallback: String?
+        var cursor: UnsafeMutablePointer<ifaddrs>? = first
+        while let current = cursor {
+            let ifa = current.pointee
+            cursor = ifa.ifa_next
+            guard let addr = ifa.ifa_addr, addr.pointee.sa_family == UInt8(AF_INET) else { continue }
+            let name = String(cString: ifa.ifa_name)
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            guard getnameinfo(addr, socklen_t(addr.pointee.sa_len),
+                              &host, socklen_t(host.count),
+                              nil, 0, NI_NUMERICHOST) == 0 else { continue }
+            let ip = String(cString: host)
+            if preferInterfaces.contains(name) && preferred == nil {
+                preferred = ip
+            } else if fallback == nil && name.hasPrefix("en") {
+                fallback = ip
             }
         }
-        if let s = start, bytes.count > s {
-            nalus.append(Data(bytes[s...]))
-        }
-        return nalus.filter { !$0.isEmpty }
+        return preferred ?? fallback
     }
 }

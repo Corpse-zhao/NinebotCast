@@ -3,7 +3,8 @@ import SwiftUI
 struct MainView: View {
     @StateObject private var engine = CastEngine()
     @State private var presetIndex = 0
-    @State private var host = "192.168.1.162"
+    @State private var host = "192.168.1.13"
+    @State private var duplicateKeyframes = true
 
     var body: some View {
         NavigationStack {
@@ -17,14 +18,17 @@ struct MainView: View {
                     TextField("仪表 IP", text: $host)
                         .keyboardType(.decimalPad)
                         .autocorrectionDisabled()
-                    Text("先在 设置 > Wi-Fi 手动连接仪表热点，再填仪表 IP（iOS 无 Wi-Fi Direct 公开 API，无法自动连接）。")
+                    Toggle("关键帧重发", isOn: $duplicateKeyframes)
+                    Text("先在仪表菜单里开启投屏模式（不用进导航）。iPhone 在 设置 > Wi-Fi 连上仪表热点后，把这里填成热点详情页里「路由器」那行的地址。")
                         .font(.footnote)
                         .foregroundColor(.secondary)
                 }
 
-                Section("投屏（骨架版：测试图）") {
+                Section("投屏（协议已对齐官方 APK）") {
                     Button {
-                        engine.start(preset: DashboardPreset.all[presetIndex], host: host)
+                        engine.start(preset: DashboardPreset.all[presetIndex],
+                                     host: host,
+                                     duplicateKeyframes: duplicateKeyframes)
                     } label: {
                         Label("开始投屏（测试图）", systemImage: "play.rectangle.fill")
                     }
@@ -39,14 +43,18 @@ struct MainView: View {
                     Text(engine.statusText)
                     Text("已发送 \(engine.sentFrames) 帧 / \(engine.sentPackets) 包")
                         .monospacedDigit()
+                    Text(engine.rtcpPongCount > 0
+                         ? "RTCP 回应 \(engine.rtcpPongCount) 次 · 往返 \(max(0, engine.lastRTTMs))ms"
+                         : "RTCP 尚无回应（等 2 秒以上）")
+                        .monospacedDigit()
+                        .foregroundColor(engine.rtcpPongCount > 0 ? .green : .secondary)
                 }
 
-                Section("待核对协议项") {
-                    Text("1. RTP payload type / 时钟基准 / SSRC（当前 96 / 90kHz）")
-                    Text("2. UDP 5013 心跳与控制包字节格式")
-                    Text("3. 七寸 KCP conv 参数与 ACK 通路")
-                    Text("4. 相册 / 摄像头 / 屏幕采集（下一阶段）")
-                        .foregroundColor(.secondary)
+                Section("协议要点（逆向自官方 APK）") {
+                    Text("视频 RTP 20 字节扩展头 · PT 32 · 1380 字节分片")
+                    Text("时间戳毫秒 · 每帧带 SPS/PPS · 关键帧每秒 1 个")
+                    Text("RTCP ping/pong 每秒 1 次（20 字节）")
+                    Text("本机端口绑定 5012/5013")
                 }
             }
             .navigationTitle("Ninebot Cast")
