@@ -16,18 +16,17 @@ final class H264Encoder {
     func setup(width: Int, height: Int, fps: Int32, bitrate: UInt32) -> Bool {
         teardown()
 
-        let spec: [CFString: Any] = [
-            kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: true
-        ]
-
+        // 编码器规格留空：iOS 系统默认优先使用硬件编码器
+        // （EnableHardwareAcceleratedVideoEncoder 键要求 iOS 17.4+，不用它以兼容低版本）
         var sessionOut: VTCompressionSession?
         let status = VTCompressionSessionCreate(
             allocator: kCFAllocatorDefault,
             width: Int32(width),
             height: Int32(height),
             codecType: kCMVideoCodecType_H264,
-            encoderSpecification: spec as CFDictionary,
+            encoderSpecification: nil,
             imageBufferAttributes: nil,
+            compressedDataAllocator: kCFAllocatorDefault,
             outputCallback: { refcon, _, status, _, sampleBuffer in
                 guard status == noErr, let sampleBuffer else { return }
                 guard let refcon else { return }
@@ -35,7 +34,6 @@ final class H264Encoder {
                 encoder.handleOutput(sampleBuffer: sampleBuffer)
             },
             refcon: Unmanaged.passUnretained(self).toOpaque(),
-            compressedDataAllocator: kCFAllocatorDefault,
             compressionSessionOut: &sessionOut)
 
         guard status == noErr, let session = sessionOut else {
@@ -68,7 +66,7 @@ final class H264Encoder {
         VTCompressionSessionEncodeFrame(
             session,
             imageBuffer: pixelBuffer,
-            presentationTimestamp: presentationTime,
+            presentationTimeStamp: presentationTime,
             duration: CMTime.invalid,
             frameProperties: nil,
             sourceFrameRefcon: nil,

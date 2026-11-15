@@ -125,7 +125,7 @@ final class CastEngine: ObservableObject {
             height: preset.height) else { return }
         frameIndex &+= 1
         let time = CMTime(value: frameIndex, timescale: preset.fps)
-        encoder.encode(pixelBuffer, presentationTimeStamp: time)
+        encoder.encode(pixelBuffer, presentationTime: time)
     }
 
     private func handleEncodedFrame(_ annexB: Data) {
