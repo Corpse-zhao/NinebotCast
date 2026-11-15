@@ -29,6 +29,7 @@ enum LanScanner {
     }
 
     /// 并发扫 1...254，逐个发 RTCP ping，收集回包。
+    /// 会跳过本机 IP（否则内核把包回环给自己，误报成"仪表回应"）。
     /// found 在找到第一个回应时回调（便于界面立刻回填 IP），completion 一定在主线程回调。
     static func scan(prefix: String,
                      port: UInt16 = 5013,
@@ -37,6 +38,7 @@ enum LanScanner {
                      completion: @escaping ([Hit]) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             var hits: [Hit] = []
+            let selfIP = localIPv4()
 
             let fd = socket(AF_INET, SOCK_DGRAM, 0)
             guard fd >= 0 else {
@@ -48,22 +50,24 @@ enum LanScanner {
 
             setNonBlocking(fd)
             let boundPort = bindLocal(fd, preferredPort: port)
-            Diag.log("scan: 本地绑定端口 \(boundPort)")
+            Diag.log("scan: 本地绑定端口 \(boundPort)，本机 \(selfIP ?? "nil") 已排除")
 
             let payload = RTCP.ping(counter: 1)
             var sentAt: [String: Int] = [:]
             for i in 1...254 {
                 let ip = "\(prefix).\(i)"
+                if ip == selfIP { continue } // 自己 ping 自己只会收到回声
                 if sendTo(fd, ip: ip, port: port, payload: payload) {
                     sentAt[ip] = nowMs()
                 }
             }
-            Diag.log("scan: 已向 \(prefix).1-254:\(port) 发出 \(sentAt.count) 个 ping")
+            Diag.log("scan: 已向 \(prefix).1-254:\(port) 发出 \(sentAt.count) 个 ping（排除本机）")
 
             let deadline = Date().addingTimeInterval(waitSeconds)
             var buffer = [UInt8](repeating: 0, count: 2048)
             while Date() < deadline {
                 if let (ip, bytes) = receiveFrom(fd, buffer: &buffer) {
+                    if ip == selfIP { continue }
                     if let index = hits.firstIndex(where: { $0.ip == ip }) {
                         let old = hits[index]
                         hits[index] = Hit(ip: ip,
@@ -82,8 +86,92 @@ enum LanScanner {
                 }
             }
 
-            Diag.log("scan: 完成，\(hits.count) 个主机回应")
+            Diag.log("scan: 完成，\(hits.count) 个主机回应（不含本机）")
             let result = hits
+            DispatchQueue.main.async { completion(result) }
+        }
+    }
+
+    /// TCP 端口扫描：谁开着这个端口谁就大概率是仪表/车机
+    /// （作者截图里仪表开着 https 8443）。非阻塞 connect + poll，分批避免撞 fd 上限。
+    /// completion 在主线程回调，返回开放该端口的主机列表。
+    static func tcpScan(prefix: String,
+                        port: UInt16 = 8443,
+                        waitMs: Int = 2500,
+                        found: @escaping (String) -> Void,
+                        completion: @escaping ([String]) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let selfIP = localIPv4()
+            var open: [String] = []
+            let hosts = (1...254).map { "\(prefix).\($0)" }.filter { $0 != selfIP }
+            let globalDeadline = Date().addingTimeInterval(Double(waitMs) / 1000.0)
+            Diag.log("tcpScan: 开始 \(prefix).1-254:\(port)（排除本机 \(selfIP ?? "nil")）")
+
+            var queue = hosts
+            while !queue.isEmpty && Date() < globalDeadline {
+                let chunk = Array(queue.prefix(60))
+                queue.removeFirst(chunk.count)
+                var pending: [(fd: Int32, ip: String)] = []
+
+                for ip in chunk {
+                    let fd = socket(AF_INET, SOCK_STREAM, 0)
+                    guard fd >= 0 else { continue }
+                    setNonBlocking(fd)
+                    var addr = sockaddr_in()
+                    addr.sin_family = sa_family_t(AF_INET)
+                    addr.sin_port = port.bigEndian
+                    guard inet_pton(AF_INET, ip, &addr.sin_addr) == 1 else {
+                        close(fd)
+                        continue
+                    }
+                    let result = withUnsafePointer(to: &addr) { pointer -> Int32 in
+                        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                            Darwin.connect(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                        }
+                    }
+                    if result == 0 {
+                        // 极少见：本地直接连上
+                        open.append(ip)
+                        Diag.log("tcpScan: \(ip):\(port) 可连接（立即）")
+                        DispatchQueue.main.async { found(ip) }
+                        close(fd)
+                    } else if errno == EINPROGRESS {
+                        pending.append((fd, ip))
+                    } else {
+                        close(fd)
+                    }
+                }
+
+                // 等这一批出结果
+                while !pending.isEmpty && Date() < globalDeadline {
+                    var fds = pending.map { pollfd(fd: $0.fd, events: Int16(POLLOUT), revents: 0) }
+                    let ready = poll(&fds, nfds_t(fds.count), 200)
+                    guard ready > 0 else { continue }
+                    var still: [(fd: Int32, ip: String)] = []
+                    for (idx, entry) in pending.enumerated() {
+                        let re = fds[idx].revents
+                        if re & (Int16(POLLOUT) | Int16(POLLERR) | Int16(POLLHUP)) != 0 {
+                            var err: Int32 = 0
+                            var len = socklen_t(MemoryLayout<Int32>.size)
+                            getsockopt(entry.fd, SOL_SOCKET, SO_ERROR, &err, &len)
+                            if err == 0 {
+                                open.append(entry.ip)
+                                Diag.log("tcpScan: \(entry.ip):\(port) 可连接")
+                                DispatchQueue.main.async { found(entry.ip) }
+                            }
+                            close(entry.fd)
+                        } else {
+                            still.append(entry)
+                        }
+                    }
+                    pending = still
+                }
+                for entry in pending { close(entry.fd) }
+                pending = []
+            }
+
+            Diag.log("tcpScan: 完成，\(open.count) 个主机开着 \(port)")
+            let result = open
             DispatchQueue.main.async { completion(result) }
         }
     }
