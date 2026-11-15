@@ -46,7 +46,7 @@ final class VideoFrameSource {
         let trackOutput = AVAssetReaderTrackOutput(track: track, outputSettings: [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
         ])
-        trackOutput.alwaysCopiesSampleBuffer = false
+        trackOutput.alwaysCopiesSampleData = false
         newReader.add(trackOutput)
         guard newReader.startReading() else {
             Diag.log("视频源：startReading 失败 \(String(describing: newReader.error))")
