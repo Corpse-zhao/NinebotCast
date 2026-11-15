@@ -16,6 +16,7 @@ final class BackgroundKeeper {
     private let engine = AVAudioEngine()
     private var sourceNode: AVAudioSourceNode?
     private var running = false
+    private var observers: [NSObjectProtocol] = []
 
     /// 是否已在保活（给界面提示用）
     var isActive: Bool { running }
@@ -48,6 +49,7 @@ final class BackgroundKeeper {
             try engine.start()
             sourceNode = src
             running = true
+            installObservers()
             Diag.log("后台保活启动（静音音频 + 禁止锁屏）")
         } catch {
             // 保活失败不致命：只是退后台会断流，前台照常
@@ -57,6 +59,7 @@ final class BackgroundKeeper {
 
     func stop() {
         UIApplication.shared.isIdleTimerDisabled = false
+        removeObservers()
         guard running else { return }
         running = false
         engine.stop()
@@ -67,5 +70,41 @@ final class BackgroundKeeper {
         try? AVAudioSession.sharedInstance().setActive(
             false, options: .notifyOthersOnDeactivation)
         Diag.log("后台保活停止")
+    }
+
+    /// 来电等音频中断结束后自动把静音引擎拉起来，否则进程还是会被挂起
+    private func installObservers() {
+        guard observers.isEmpty else { return }
+        let center = NotificationCenter.default
+        let interruption = center.addObserver(
+            forName: AVAudioSession.interruptionNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.resumeIfNeeded(reason: "音频中断结束")
+        }
+        let reset = center.addObserver(
+            forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.resumeIfNeeded(reason: "媒体服务重置")
+        }
+        observers = [interruption, reset]
+    }
+
+    private func removeObservers() {
+        let center = NotificationCenter.default
+        for observer in observers {
+            center.removeObserver(observer)
+        }
+        observers = []
+    }
+
+    private func resumeIfNeeded(reason: String) {
+        guard running, !engine.isRunning else { return }
+        do {
+            try AVAudioSession.sharedInstance().setActive(true)
+            try engine.start()
+            Diag.log("后台保活：\(reason)，静音引擎已恢复")
+        } catch {
+            Diag.log("后台保活：\(reason)恢复失败 \(error.localizedDescription)")
+        }
     }
 }

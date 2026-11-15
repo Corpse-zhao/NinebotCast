@@ -1,6 +1,7 @@
 import Foundation
 import CoreMedia
 import UIKit
+import AVFoundation
 
 /// 投屏引擎：帧定时器 → 测试图 → VideoToolbox → RTP 打包 → UDP 5012
 /// RTCP ping/pong 走 UDP 5013（每 1 秒一次，20 字节，逆向自官方 APK）
@@ -39,9 +40,13 @@ final class CastEngine: ObservableObject {
     private var pingCounter: UInt32 = 0
     private var pingSentTimes: [UInt32: Int] = [:]
     private var duplicateKeyframes = true
-    /// 选了图片就用图片当画面源，没选就用测试图
+    /// 画面源：测试图 / 相册图片 / 相册视频（循环）/ 摄像头
     private var photoImage: UIImage?
+    private var photoRotation = 0
     private var photoBuffer: CVPixelBuffer?
+    private var videoSource: VideoFrameSource?
+    private var cameraSource: CameraSource?
+    private var cameraRotation = 0
 
     private let frameQueue = DispatchQueue(label: "ninebotcast.frames")
     private let callbackQueue = DispatchQueue(label: "ninebotcast.send")
@@ -56,19 +61,71 @@ final class CastEngine: ObservableObject {
 
     /// 选一张相册图片当画面源；传 nil 回到测试图
     func setPhoto(_ image: UIImage?) {
-        photoImage = image
-        rebuildPhotoBuffer()
+        usePhoto(image, rotation: photoRotation)
     }
 
     private func rebuildPhotoBuffer() {
         guard let photoImage else {
             photoBuffer = nil
+            return
+        }
+        photoBuffer = FrameRenderer.drawImage(
+            photoImage, rotation: photoRotation,
+            width: preset.width, height: preset.height)
+    }
+
+    private func teardownSources() {
+        videoSource?.stop()
+        videoSource = nil
+        cameraSource?.stop()
+        cameraSource = nil
+        photoBuffer = nil
+        photoImage = nil
+    }
+
+    /// 回到内置测试图
+    func useTestImage() {
+        teardownSources()
+        Diag.log("画面源：测试图")
+    }
+
+    /// 相册图片（静态，铺满 + 可旋转）
+    func usePhoto(_ image: UIImage?, rotation: Int) {
+        teardownSources()
+        guard let image else {
             Diag.log("画面源：测试图")
             return
         }
-        photoBuffer = PhotoSource.makePixelBuffer(
-            from: photoImage, width: preset.width, height: preset.height)
-        Diag.log("画面源：图片 \(Int(photoImage.size.width))x\(Int(photoImage.size.height)) → \(preset.width)x\(preset.height)")
+        photoImage = image
+        photoRotation = rotation
+        rebuildPhotoBuffer()
+        Diag.log("画面源：图片 rot=\(rotation) → \(preset.width)x\(preset.height)")
+    }
+
+    /// 相册视频（循环播放，铺满 + 可旋转）
+    func useVideo(url: URL, rotation: Int) {
+        teardownSources()
+        let source = VideoFrameSource(url: url, width: preset.width, height: preset.height,
+                                      rotation: rotation)
+        source.start()
+        videoSource = source
+        Diag.log("画面源：视频 \(url.lastPathComponent) rot=\(rotation)")
+    }
+
+    /// 摄像头（铺满 + 可旋转）
+    func useCamera(position: AVCaptureDevice.Position, rotation: Int) {
+        teardownSources()
+        cameraRotation = rotation
+        let source = CameraSource()
+        source.start(position: position) { [weak self] error in
+            if let error {
+                Diag.log("摄像头启动失败：\(error)")
+                DispatchQueue.main.async {
+                    self?.dashboardReport = "摄像头启动失败：\(error)"
+                }
+            }
+        }
+        cameraSource = source
     }
 
     /// - Parameter pingOnly: 只发 RTCP ping，不建编码器、不发视频。用于隔离闪退原因。
@@ -251,7 +308,22 @@ final class CastEngine: ObservableObject {
     private func produceFrame() {
         autoreleasepool {
             guard let encoder else { return }
-            // 有图片就发图片（每帧重复编码同一张），否则发测试图
+            // 视频源：每拍拉一帧（循环播放）
+            if let videoSource, let buffer = videoSource.nextFrame() {
+                frameIndex &+= 1
+                encoder.encode(buffer,
+                               presentationTime: CMTime(value: frameIndex, timescale: preset.fps))
+                return
+            }
+            // 摄像头：取最新帧（后台采集停止时自动停在最后一帧，流不断）
+            if let cameraSource, let buffer = cameraSource.renderedFrame(
+                width: preset.width, height: preset.height, rotation: cameraRotation) {
+                frameIndex &+= 1
+                encoder.encode(buffer,
+                               presentationTime: CMTime(value: frameIndex, timescale: preset.fps))
+                return
+            }
+            // 图片：每帧重复编码同一张
             if let photoBuffer {
                 frameIndex &+= 1
                 encoder.encode(photoBuffer,

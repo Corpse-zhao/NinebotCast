@@ -28,6 +28,11 @@ struct MainView: View {
     @State private var localIP = "-"
     @State private var pickedItem: PhotosPickerItem?
     @State private var pickedImage: UIImage?
+    @State private var pickedVideoItem: PhotosPickerItem?
+    @State private var pickedVideoURL: URL?
+    @State private var sourceIndex = 0      // 0 测试图 1 图片 2 视频 3 摄像头
+    @State private var rotationIndex = 0    // 0/90/180/270
+    @State private var cameraPositionIndex = 0 // 0 后置 1 前置
 
     var body: some View {
         NavigationStack {
@@ -64,32 +69,66 @@ struct MainView: View {
                 }
 
                 Section("画面来源") {
-                    PhotosPicker(selection: $pickedItem, matching: .images) {
-                        Label(pickedImage == nil ? "选择图片投屏" : "更换图片",
-                              systemImage: "photo.on.rectangle.angled")
+                    Picker("来源", selection: $sourceIndex) {
+                        Text("测试图").tag(0)
+                        Text("图片").tag(1)
+                        Text("视频").tag(2)
+                        Text("摄像头").tag(3)
                     }
-                    if let pickedImage {
-                        HStack(spacing: 12) {
-                            Image(uiImage: pickedImage)
-                                .resizable()
-                                .scaledToFill()
-                                .frame(width: 72, height: 48)
-                                .clipped()
-                                .cornerRadius(6)
-                            Text("\(Int(pickedImage.size.width))×\(Int(pickedImage.size.height))，将按预设分辨率等比缩放")
+                    Picker("方向", selection: $rotationIndex) {
+                        Text("0°").tag(0)
+                        Text("90°").tag(1)
+                        Text("180°").tag(2)
+                        Text("270°").tag(3)
+                    }
+                    if sourceIndex == 1 {
+                        PhotosPicker(selection: $pickedItem, matching: .images) {
+                            Label(pickedImage == nil ? "选择图片" : "更换图片",
+                                  systemImage: "photo.on.rectangle.angled")
+                        }
+                        if let pickedImage {
+                            HStack(spacing: 12) {
+                                Image(uiImage: pickedImage)
+                                    .resizable()
+                                    .scaledToFill()
+                                    .frame(width: 72, height: 48)
+                                    .clipped()
+                                    .cornerRadius(6)
+                                Text("已铺满目标分辨率（超出部分裁掉）")
+                                    .font(.footnote)
+                                    .foregroundColor(.secondary)
+                                Spacer()
+                            }
+                        }
+                    }
+                    if sourceIndex == 2 {
+                        PhotosPicker(selection: $pickedVideoItem, matching: .videos) {
+                            Label(pickedVideoURL == nil ? "选择视频" : "更换视频",
+                                  systemImage: "video.badge.plus")
+                        }
+                        if let pickedVideoURL {
+                            Text("已选 \(pickedVideoURL.lastPathComponent)，循环播放；按投屏帧率取帧，速度可能略慢于原速")
                                 .font(.footnote)
                                 .foregroundColor(.secondary)
-                            Spacer()
-                        }
-                        Button("清除图片（回到测试图）", role: .destructive) {
-                            self.pickedImage = nil
-                            self.pickedItem = nil
-                            engine.setPhoto(nil)
                         }
                     }
-                    Text("没选图片时发内置测试图（彩条 + 绿滑块 + 帧号）。图片是静态的，会按帧率持续重发，仪表上看到的是一张定住的图。视频和摄像头投屏放下一版。")
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
+                    if sourceIndex == 3 {
+                        Picker("摄像头", selection: $cameraPositionIndex) {
+                            Text("后置").tag(0)
+                            Text("前置").tag(1)
+                        }
+                        Text("iOS 限制：退后台后摄像头会停止采集，画面停在最后一帧但流不断；图片和视频源退后台不受影响。")
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
+                    }
+                    Button("清除来源（回到测试图）", role: .destructive) {
+                        pickedImage = nil
+                        pickedItem = nil
+                        pickedVideoURL = nil
+                        pickedVideoItem = nil
+                        sourceIndex = 0
+                        engine.useTestImage()
+                    }
                 }
 
                 Section("找不到 IP？按 ①②③ 来") {
@@ -211,10 +250,59 @@ struct MainView: View {
                           let image = UIImage(data: data) else { return }
                     await MainActor.run {
                         pickedImage = image
-                        engine.setPhoto(image)
+                        applySource()
                     }
                 }
             }
+            .onChange(of: pickedVideoItem) { item in
+                guard let item else { return }
+                Task {
+                    // 视频先拷到临时目录再交给播放源（AVAssetReader 需要本地文件 URL）
+                    guard let data = try? await item.loadTransferable(type: Data.self) else { return }
+                    let url = FileManager.default.temporaryDirectory
+                        .appendingPathComponent("cast-video-\(UUID().uuidString).mp4")
+                    do {
+                        try data.write(to: url)
+                    } catch {
+                        await MainActor.run { scanSummary = "视频保存失败：\(error.localizedDescription)" }
+                        return
+                    }
+                    await MainActor.run {
+                        pickedVideoURL = url
+                        applySource()
+                    }
+                }
+            }
+            .onChange(of: sourceIndex) { _ in applySource() }
+            .onChange(of: rotationIndex) { _ in applySource() }
+            .onChange(of: cameraPositionIndex) { _ in
+                if sourceIndex == 3 { applySource() }
+            }
+        }
+    }
+
+    private func applySource() {
+        let rotation = [0, 90, 180, 270][rotationIndex]
+        switch sourceIndex {
+        case 0:
+            engine.useTestImage()
+        case 1:
+            if let pickedImage {
+                engine.usePhoto(pickedImage, rotation: rotation)
+            } else {
+                engine.useTestImage()
+            }
+        case 2:
+            if let pickedVideoURL {
+                engine.useVideo(url: pickedVideoURL, rotation: rotation)
+            } else {
+                engine.useTestImage()
+            }
+        case 3:
+            engine.useCamera(position: cameraPositionIndex == 0 ? .back : .front,
+                             rotation: rotation)
+        default:
+            break
         }
     }
 
