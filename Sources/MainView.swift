@@ -18,6 +18,7 @@ struct MainView: View {
     @State private var pingOnly = false
     @State private var scanning = false
     @State private var tcpScanning = false
+    @State private var probing = false
     @State private var scanSummary = ""
     @State private var diagText = Diag.tail(16)
     @State private var localIP = "-"
@@ -56,36 +57,40 @@ struct MainView: View {
                         .foregroundColor(.secondary)
                 }
 
-                Section("找不到 IP？扫一下") {
+                Section("找不到 IP？按 ①②③ 来") {
                     Button {
-                        runScan()
+                        fillGateway()
                     } label: {
-                        Label(scanning ? "RTCP 扫描中…（约 2 秒）" : "扫描：谁在 5013 回应 RTCP ping",
-                              systemImage: "dot.radiowaves.left.and.right")
+                        Label("① 填入网关 .1（热点由车机发 DHCP，网关通常就是它）",
+                              systemImage: "1.circle")
                     }
-                    .disabled(scanning || tcpScanning)
+                    Button {
+                        runProbe()
+                    } label: {
+                        Label(probing ? "体检中…" : "② 体检当前 IP（TCP 端口 + RTCP 5013）",
+                              systemImage: "2.circle")
+                    }
+                    .disabled(probing)
                     Button {
                         runTcpScan()
                     } label: {
-                        Label(tcpScanning ? "TCP 扫描中…（约 3 秒）" : "扫描：谁开着 8443 端口（找仪表）",
-                              systemImage: "network")
+                        Label(tcpScanning ? "端口扫描中…（约 8 秒）" : "③ 扫全段端口（8443/80/443/5000…）",
+                              systemImage: "3.circle")
                     }
-                    .disabled(scanning || tcpScanning)
+                    .disabled(tcpScanning)
                     Button {
-                        if let prefix = LanScanner.localPrefix() {
-                            host = "\(prefix).1"
-                            scanSummary = "已填入网关地址 \(host)，一般就是仪表"
-                        }
+                        runScan()
                     } label: {
-                        Label("填入网关地址 .1（仪表热点的网关通常就是仪表）",
-                              systemImage: "arrow.uturn.right.circle")
+                        Label(scanning ? "RTCP 扫描中…（约 2 秒）" : "扫全段 RTCP 5013（需仪表在接收态）",
+                              systemImage: "dot.radiowaves.left.and.right")
                     }
+                    .disabled(scanning)
                     if !scanSummary.isEmpty {
                         Text(scanSummary)
                             .font(.footnote)
                             .monospaced()
                     }
-                    Text("提示：8443 扫到的 IP 大概率是仪表；RTCP 只在仪表处于接收态时才回应。填好后直接「开始投屏」，看帧数有没有涨、仪表有没有出画面。")
+                    Text("说明：8443 只是车机上常见的网页端口之一，不同车型/固件开的端口不一样（也有 80、443、5000、8080，甚至全关）。真正确定的投屏通道只有 UDP 5012/5013，来自官方 APK 逆向。")
                         .font(.footnote)
                         .foregroundColor(.secondary)
                 }
@@ -163,24 +168,44 @@ struct MainView: View {
         }
     }
 
-    private func runScan() {
-        guard let prefix = LanScanner.localPrefix() else {
+    private func fillGateway() {
+        guard let gateway = LanScanner.gatewayGuess() else {
             scanSummary = "拿不到本机 Wi-Fi 地址：先连上仪表热点"
             return
         }
-        scanning = true
-        scanSummary = "扫描 \(prefix).1-254 的 5013 …"
-        LanScanner.scan(prefix: prefix) { hit in
-            // 第一个回应的主机直接回填
-            host = hit.ip
-            scanSummary = "先回应的：\(hit.ip) \(hit.rttMs)ms\n\(hit.replyHex)"
-        } completion: { hits in
-            scanning = false
-            if hits.isEmpty {
-                scanSummary = "\(prefix).0/24 没有主机在 5013 回应 RTCP ping。\n说明仪表还没进入投屏接收状态（或端口不是 5013）。"
-            } else {
-                scanSummary = hits.map { "\($0.ip)  \($0.rttMs)ms  ×\($0.replyCount)  \($0.replyHex)" }
-                    .joined(separator: "\n")
+        host = gateway
+        scanSummary = "已填入网关 \(gateway)（车机热点自己发 DHCP，网关通常就是它）。\n填好点「② 体检」验一下，再开始投屏。"
+    }
+
+    private func runProbe() {
+        let ip = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !ip.isEmpty else {
+            scanSummary = "先填一个 IP 再体检"
+            return
+        }
+        guard ip != localIP else {
+            scanSummary = "这是本机地址（\(ip)），换仪表的 IP"
+            return
+        }
+        probing = true
+        scanSummary = "体检 \(ip) …（端口 + RTCP，约 3 秒）"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = LanScanner.probe(ip: ip)
+            DispatchQueue.main.async {
+                probing = false
+                var lines: [String] = []
+                if result.openPorts.isEmpty {
+                    lines.append("TCP：常见端口都没开")
+                } else {
+                    lines.append("TCP 开放：\(result.openPorts.map { String($0) }.joined(separator: ", "))")
+                }
+                lines.append(result.rtcpPong
+                             ? "RTCP 5013：有 pong（\(result.rttMs)ms）"
+                             : "RTCP 5013：无回应（不在接收态，或 IP 不对）")
+                if !result.pongHex.isEmpty {
+                    lines.append(result.pongHex)
+                }
+                scanSummary = lines.joined(separator: "\n")
             }
         }
     }
@@ -191,16 +216,40 @@ struct MainView: View {
             return
         }
         tcpScanning = true
-        scanSummary = "TCP 扫描 \(prefix).1-254 的 8443 …"
+        scanSummary = "扫 \(prefix).1-254 的 8443/80/443/5000/8080/8000/9000 …"
         LanScanner.tcpScan(prefix: prefix) { ip in
             host = ip
-            scanSummary = "8443 开着：\(ip)（已回填仪表 IP）"
-        } completion: { ips in
+            scanSummary = "发现有开放端口：\(ip)（已回填）"
+        } completion: { hits in
             tcpScanning = false
-            if ips.isEmpty {
-                scanSummary = "\(prefix).0/24 没有主机开着 8443。\n可以试试「填入网关地址 .1」，或确认仪表真的进入了投屏接收态。"
+            if hits.isEmpty {
+                scanSummary = "\(prefix).0/24 没有主机开放这些端口。\n换「① 网关 .1」或「扫 RTCP 5013」试试——端口只是线索，投屏通道是 UDP 5012/5013。"
             } else {
-                scanSummary = "开着 8443 的主机（已回填最后一个）：\n" + ips.joined(separator: "\n")
+                scanSummary = hits
+                    .map { "\($0.ip)  端口 \($0.ports.map { String($0) }.joined(separator: "/"))" }
+                    .joined(separator: "\n")
+            }
+        }
+    }
+
+    private func runScan() {
+        guard let prefix = LanScanner.localPrefix() else {
+            scanSummary = "拿不到本机 Wi-Fi 地址：先连上仪表热点"
+            return
+        }
+        scanning = true
+        scanSummary = "扫描 \(prefix).1-254 的 5013（含广播探测）…"
+        LanScanner.scan(prefix: prefix) { hit in
+            // 第一个回应的主机直接回填
+            host = hit.ip
+            scanSummary = "先回应的：\(hit.ip) \(hit.rttMs)ms\n\(hit.replyHex)"
+        } completion: { hits in
+            scanning = false
+            if hits.isEmpty {
+                scanSummary = "\(prefix).0/24 没有主机在 5013 回应（本机已排除）。\n仪表多半还没进入投屏接收态——先在仪表/官方 App 里进接收态，再扫一次。"
+            } else {
+                scanSummary = hits.map { "\($0.ip)  \($0.rttMs)ms  ×\($0.replyCount)  \($0.replyHex)" }
+                    .joined(separator: "\n")
             }
         }
     }
