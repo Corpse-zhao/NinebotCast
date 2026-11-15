@@ -25,7 +25,7 @@ final class CastEngine: ObservableObject {
     private var pingTimer: DispatchSourceTimer?
     private var frameIndex: Int64 = 0
     private var pingCounter: UInt32 = 0
-    private var pingSentTimes: [UInt32: Int64] = [:]
+    private var pingSentTimes: [UInt32: Int] = [:]
     private var duplicateKeyframes = true
 
     private let frameQueue = DispatchQueue(label: "ninebotcast.frames")
@@ -136,7 +136,7 @@ final class CastEngine: ObservableObject {
 
     private func sendPing() {
         pingCounter &+= 1
-        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        let now = Int(Date().timeIntervalSince1970 * 1000)
         callbackQueue.sync {
             pingSentTimes[pingCounter] = now
             if pingSentTimes.count > 16 {
@@ -159,12 +159,12 @@ final class CastEngine: ObservableObject {
 
     private func handleEncodedFrame(_ annexB: Data, keyframe: Bool) {
         callbackQueue.sync {
-            guard let selfPacker = packer else { return }
+            guard packer != nil else { return }
             guard !annexB.isEmpty else { return }
 
             // 时间戳：毫秒（帧序号 × 1000 / fps）
             let timestampMs = UInt32((frameIndex * 1000) / Int64(preset.fps))
-            let packets = selfPacker.packetizeFrame(annexB, timestampMs: timestampMs, isKeyframe: keyframe)
+            let packets = packer!.packetizeFrame(annexB, timestampMs: timestampMs, isKeyframe: keyframe)
             let copies = (keyframe && duplicateKeyframes) ? 2 : 1
             for _ in 0..<copies {
                 for packet in packets {
