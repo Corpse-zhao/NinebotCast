@@ -31,7 +31,7 @@ final class KCPChannel {
         guard let kcp, !data.isEmpty else { return }
         data.withUnsafeBytes { raw in
             if let base = raw.baseAddress {
-                ikcp_send(kcp, base.assumingMemoryBound(to: CChar.self), raw.count)
+                ikcp_send(kcp, base.assumingMemoryBound(to: CChar.self), Int32(raw.count))
             }
         }
     }
