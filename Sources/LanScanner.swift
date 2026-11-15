@@ -69,7 +69,7 @@ enum LanScanner {
                      completion: @escaping ([Hit]) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             var hits: [Hit] = []
-            let selfIP = localIPv4()
+            let selfIP = localIPv4() ?? ""
 
             let fd = socket(AF_INET, SOCK_DGRAM, 0)
             guard fd >= 0 else {
@@ -83,7 +83,7 @@ enum LanScanner {
             var on: Int32 = 1
             setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &on, socklen_t(MemoryLayout<Int32>.size))
             let boundPort = bindLocal(fd, preferredPort: port)
-            Diag.log("scan: 本地绑定端口 \(boundPort)，本机 \(selfIP ?? "nil") 已排除")
+            Diag.log("scan: 本地绑定端口 \(boundPort)，本机 \(selfIP.isEmpty ? "nil" : selfIP) 已排除")
 
             let payload = RTCP.ping(counter: 1)
             var sentAt: [String: Int] = [:]
@@ -160,7 +160,7 @@ enum LanScanner {
 
     /// 同步扫单一端口（内部用，分批 60 个连接，避免撞 iOS 的 fd 上限）
     private static func tcpScanPort(prefix: String, port: UInt16, waitMs: Int) -> [String] {
-        let selfIP = localIPv4()
+        let selfIP = localIPv4() ?? ""
         var open: [String] = []
         var queue = (1...254).map { "\(prefix).\($0)" }.filter { $0 != selfIP }
         let globalDeadline = Date().addingTimeInterval(Double(waitMs) / 1000.0)
