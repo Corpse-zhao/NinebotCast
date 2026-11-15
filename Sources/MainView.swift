@@ -24,6 +24,20 @@ struct MainView: View {
     var body: some View {
         NavigationStack {
             Form {
+                // 版本横幅放最顶上，打开就能看到：装没装对包，一眼分辨
+                Section {
+                    HStack {
+                        Text("v\(AppVersion.short) (\(AppVersion.build))")
+                            .font(.title2)
+                            .bold()
+                            .monospacedDigit()
+                        Spacer()
+                        Text("显示 1.0 = 旧包（会闪退）")
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
+                    }
+                }
+
                 Section("仪表预设") {
                     Picker("预设", selection: $presetIndex) {
                         ForEach(Array(DashboardPreset.all.enumerated()), id: \.element.id) { index, preset in
