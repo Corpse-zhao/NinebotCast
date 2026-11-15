@@ -14,8 +14,13 @@ import Foundation
 /// - [18..19] BE16(1024 | (时间戳低10位))（帧级标识）
 /// - 负载：Annex-B 原始字节流按 1380 字节切块（不按 NALU 对齐）
 struct RTPPacker {
-    let chunkSize = 1380
+    /// 分片大小：官方 iOS 端默认 MTU 1400，APK 逆向看到 1380，两个都要能试
+    var chunkSize: Int = 1400
     private(set) var sequence: UInt16 = 0
+
+    init(chunkSize: Int = 1400) {
+        self.chunkSize = chunkSize
+    }
 
     mutating func packetizeFrame(_ frame: Data, timestampMs: UInt32, isKeyframe: Bool) -> [Data] {
         let bytes = [UInt8](frame)
@@ -51,9 +56,21 @@ struct RTPPacker {
     }
 }
 
-/// 5013 上的 RTCP 风格 ping/pong（逆向自 sd.h / sd.i）
+/// 5013 上的 RTCP 风格控制包
 enum RTCP {
+    /// 官方 iOS 心跳：RTCP APP，子类型 5，length=4（20 字节），app data = int32 0, int32 2
+    /// 依据：九号出行 6.10.9 逆向报告 —— `createStartHeartBeatCommand` = createAppCommandBy:5 withValues:[0,2]
+    static func heartbeat() -> Data {
+        var d = Data(repeating: 0, count: 20)
+        d[0] = 0x85          // V=2 | subtype=5
+        d[1] = 0xCC          // PT=204 (APP)
+        d[3] = 4             // length = 4 words → 20 字节
+        d[19] = 2            // app data: [0, 2]（int32 大端连续）
+        return d
+    }
+
     /// 20 字节 ping：85 CC 00 04 + 8 个 0 + 序号(LE32) + 02 00 00 00
+    /// （APK 逆向得到的变体，作为心跳的兼容备份，两个都发）
     static func ping(counter: UInt32) -> Data {
         var d = Data(repeating: 0, count: 20)
         d[0] = 0x85

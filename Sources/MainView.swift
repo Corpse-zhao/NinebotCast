@@ -15,6 +15,8 @@ struct MainView: View {
     @State private var presetIndex = 0
     @State private var host = "192.168.1.13"
     @State private var duplicateKeyframes = true
+    @State private var chunk1400 = true
+    @State private var gopTen = true
     @State private var pingOnly = false
     @State private var scanning = false
     @State private var tcpScanning = false
@@ -52,7 +54,7 @@ struct MainView: View {
                     Text("本机 Wi-Fi 地址：\(localIP)")
                         .font(.footnote)
                         .foregroundColor(.secondary)
-                    Text("先在仪表或官方 App 的巡航投屏里让仪表进入投屏状态（官方是点车辆页巡航入口）。iPhone 在 设置 > Wi-Fi 连上仪表热点后，把这里填成热点详情页里「路由器」那行的地址。别填本机地址。")
+                    Text("关键前提：仪表必须已由九号自己的巡航逻辑进入投屏接收态（官方 App 车辆页 → 仪表投屏导航 → 投屏导航，等仪表出地图），然后**把九号出行切到后台**（它退后台会暂停自己的视频），仪表才在等新的流。iPhone 连上仪表热点后，IP 填热点详情页「路由器」那行，别填本机地址。")
                         .font(.footnote)
                         .foregroundColor(.secondary)
                 }
@@ -95,13 +97,17 @@ struct MainView: View {
                         .foregroundColor(.secondary)
                 }
 
-                Section("投屏（协议已对齐官方 APK）") {
+                Section("投屏（协议已对齐官方 APK 与 iOS 逆向）") {
                     Toggle("关键帧重发", isOn: $duplicateKeyframes)
+                    Toggle("分片 1400 字节（关 = 1380，APK 值）", isOn: $chunk1400)
+                    Toggle("关键帧每 10 帧（官方 gopSize）", isOn: $gopTen)
                     Toggle("只发 ping（不编码，用于排查闪退）", isOn: $pingOnly)
                     Button {
                         engine.start(preset: DashboardPreset.all[presetIndex],
                                       host: host,
                                       duplicateKeyframes: duplicateKeyframes,
+                                      packetSize: chunk1400 ? 1400 : 1380,
+                                      gop: gopTen ? 10 : Int(DashboardPreset.all[presetIndex].fps),
                                       pingOnly: pingOnly)
                     } label: {
                         Label(pingOnly ? "开始（仅 ping）" : "开始投屏（测试图）",

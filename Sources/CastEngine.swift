@@ -51,9 +51,13 @@ final class CastEngine: ObservableObject {
     }
 
     /// - Parameter pingOnly: 只发 RTCP ping，不建编码器、不发视频。用于隔离闪退原因。
+    /// - Parameter packetSize: RTP 分片大小（官方 1400 / APK 1380）
+    /// - Parameter gop: 关键帧间隔（官方 gopSize=10）
     func start(preset: DashboardPreset,
                host: String,
                duplicateKeyframes: Bool,
+               packetSize: Int = 1400,
+               gop: Int = 10,
                pingOnly: Bool = false) {
         guard preset.isImplemented || pingOnly else {
             statusText = "该预设未实现（JPEG 模式待开发）"
@@ -119,7 +123,7 @@ final class CastEngine: ObservableObject {
             let encoder = H264Encoder()
             guard encoder.setup(
                 width: preset.width, height: preset.height,
-                fps: preset.fps, bitrate: preset.bitrate) else {
+                fps: preset.fps, bitrate: preset.bitrate, gop: gop) else {
                 statusText = "H.264 编码器初始化失败（看诊断日志）"
                 return
             }
@@ -128,7 +132,7 @@ final class CastEngine: ObservableObject {
             }
             self.encoder = encoder
 
-            onSendQueue { packer = RTPPacker() }
+            onSendQueue { packer = RTPPacker(chunkSize: packetSize) }
         }
 
         // RTCP ping：每 1 秒一次（官方节奏），计数器从 1 开始
@@ -205,9 +209,11 @@ final class CastEngine: ObservableObject {
         if pingSentTimes.count > 16 {
             pingSentTimes.removeValue(forKey: pingSentTimes.keys.first!)
         }
+        // 官方心跳（APP 子类型 5，参数 [0,2]）先发；再发计数变体兜底，两包都无害
+        controlChannel?.send(RTCP.heartbeat())
         controlChannel?.send(RTCP.ping(counter: pingCounter))
         if pingCounter == 1 {
-            Diag.log("首个 RTCP ping 已发出")
+            Diag.log("首个心跳已发出（官方 [0,2] + 计数变体）")
         }
     }
 

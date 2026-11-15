@@ -4,10 +4,23 @@
 
 原仓库只分发 Android APK（无源码），本项目按其 README 公开的协议参数从零重写 iOS 版。
 
+## 同类项目调研（2026-11-15）
+
+| 项目 | 路线 | 对本项目的价值 |
+|---|---|---|
+| [xmz28/ninebot_pro](https://github.com/xmz28/ninebot_pro) | Android APK，UDP 5012/5013 + RTP | 初始协议参照（20 字节头 / PT 32 / 毫秒时间戳 / 1380 分片） |
+| [Xiaolangs/ninebot-cast-tweak](https://github.com/Xiaolangs/ninebot-cast-tweak) | iOS 九号出行 6.10.9 Ghidra 逆向 + 越狱 tweak | **最有价值**：投屏导航不是镜像屏幕，而是手机自绘 HUD（240×320 / 25fps / **500 kbps** / gop 10 / MTU 1400）；`RTPStandard==2` 才带视频专用扩展头；**RTCP APP 心跳 = 子类型 5、参数 [0,2]**；还有 BLE 与 KCP 两条备用通道 |
+| [KaruMono/NinebotEnhance](https://github.com/KaruMono/NinebotEnhance) | Android LSPosed 模块，接管九号自己的编码发送链路 | **已在 M5P（车型 14103，仪表 848×480，Wi-Fi Direct H.264）实测**；并明确「是否开机由九号自己的巡航逻辑检查」——仪表必须先进投屏接收态 |
+| [xmz28/ForzaDash](https://github.com/xmz28/ForzaDash) | ESP32 USB/Wi-Fi CAN 注入仪表（0x170/0x210/0x212） | 与视频投屏无关，但证明仪表数据面可注入，可作后续「速度/功率叠加」参考 |
+| [OpenXPlay/OpenXPlay](https://github.com/OpenXPlay/OpenXPlay) | CarPlay 转发到安卓车机 | 只解释作者视频里 8443 那套 Web 接收端，不经九号仪表通道 |
+
+据此修正的实现：心跳改官方 `APP subtype 5 / [0,2]`（保留计数变体兜底）、分片 1400/1380 可切换、gop 10、新增 848×480 25fps 800kbps 预设。
+
 ## 版本记录
 
 | 版本 | 变更 |
 |------|------|
+| 0.9.0 (9) | 心跳改官方格式（RTCP APP 子类型 5、参数 [0,2]，同时保留计数变体）；RTP 分片 1400/1380 可切；关键帧间隔 gop 10；新增 848×480 25fps 800kbps（官方 HUD 参数）预设；界面提示改为「必须先进巡航接收态 + 把官方 App 切后台」 |
 | 0.8.0 (8) | 端口不再只赌 8443：TCP 扫 8443/80/443/5000/8080/8000/9000 并显示每台开了哪些；RTCP 扫描加广播探测；新增「体检当前 IP」（端口+RTCP+pong 原文）；①网关 ②体检 ③扫段 三步引导 |
 | 0.7.0 (7) | 扫描排除本机（热点下手机是 .3，自己 ping 自己被误判成仪表）；新增 TCP 8443 端口扫描找仪表；pong 只认 85 CC 00 04 头（实测仪表回包字段与 APK 假设不同）；新增「填入网关 .1」 |
 | 0.6.0 (6) | 专属头像 App 图标；版本号大字放界面顶部（防装错旧包）；产物按版本命名 |

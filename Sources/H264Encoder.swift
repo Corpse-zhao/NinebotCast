@@ -20,7 +20,7 @@ final class H264Encoder {
     private var isTornDown = true
     private var encodedCount = 0
 
-    func setup(width: Int, height: Int, fps: Int32, bitrate: UInt32) -> Bool {
+    func setup(width: Int, height: Int, fps: Int32, bitrate: UInt32, gop: Int = 10) -> Bool {
         teardown()
         guard width > 0, height > 0, fps > 0 else {
             Diag.log("VT setup 参数非法 \(width)x\(height) fps=\(fps)")
@@ -61,7 +61,7 @@ final class H264Encoder {
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate,
                              value: NSNumber(value: Int(fps)))
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval,
-                             value: NSNumber(value: Int(fps))) // 每秒 1 个关键帧
+                             value: NSNumber(value: max(1, gop))) // 官方 gopSize = 10
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering,
                              value: kCFBooleanFalse)
 
