@@ -15,16 +15,17 @@ enum AppVersion {
 
 struct MainView: View {
     @StateObject private var engine = CastEngine()
+    @Environment(\.colorScheme) private var scheme
+
     @State private var presetIndex = 0
     @State private var host = "192.168.1.13"
     @State private var duplicateKeyframes = true
     @State private var chunk1400 = true
     @State private var gopTen = true
     @State private var pingOnly = false
-    @State private var showTools = false       // 找 IP 工具折叠
-    @State private var showAdvanced = false    // 协议开关折叠
-    @State private var showDiag = false        // 诊断折叠
-    @State private var showPrereq = true       // 关键前提默认展开（新手必读）
+    @State private var showTools = false
+    @State private var showAdvanced = false
+    @State private var showDiag = false
     @State private var scanning = false
     @State private var tcpScanning = false
     @State private var probing = false
@@ -50,154 +51,211 @@ struct MainView: View {
     @State private var cameraPositionIndex = 0 // 0 后置 1 前置
 
     private static let previewContext = CIContext(options: nil)
+    private let accent = Color(red: 0.29, green: 0.47, blue: 0.98)
+    private let accent2 = Color(red: 0.55, green: 0.36, blue: 0.96)
 
     var body: some View {
-        NavigationStack {
-            Form {
-                versionBanner
-                connectionSection
-                sourceSection
-                castSection
-                statusSection
-                diagSection
-                footnoteSection
+        ZStack {
+            backgroundGradient.ignoresSafeArea()
+            ScrollView(showsIndicators: false) {
+                VStack(spacing: 14) {
+                    header
+                    connectionCard
+                    sourceCard
+                    metricsCard
+                    diagCard
+                    footer
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 6)
+                .padding(.bottom, 132)
             }
-            .navigationTitle("Ninebot Cast")
-            .onAppear {
-                localIP = LanScanner.localIPv4() ?? "未连 Wi-Fi"
-                diagText = Diag.tail(16)
-                Diag.log("MainView 出现，版本 \(AppVersion.display)")
-            }
-            .onChange(of: pickedItem) { item in
-                guard let item else { return }
-                Task {
-                    guard let data = try? await item.loadTransferable(type: Data.self),
-                          let image = UIImage(data: data) else { return }
-                    await MainActor.run {
-                        pendingImage = image
-                        imageConfirmed = false   // 新图必须重新确认
-                    }
+        }
+        .overlay(alignment: .bottom) { actionBar }
+        .sheet(isPresented: $showImagePreview) { imagePreviewSheet }
+        .sheet(isPresented: $showTools) { toolsSheet }
+        .onAppear {
+            localIP = LanScanner.localIPv4() ?? "未连 Wi-Fi"
+            diagText = Diag.tail(16)
+            Diag.log("MainView 出现，版本 \(AppVersion.display)")
+        }
+        .onChange(of: pickedItem) { item in
+            guard let item else { return }
+            Task {
+                guard let data = try? await item.loadTransferable(type: Data.self),
+                      let image = UIImage(data: data) else { return }
+                await MainActor.run {
+                    pendingImage = image
+                    imageConfirmed = false
                 }
             }
-            .onChange(of: pickedVideoItem) { item in
-                guard let item else { return }
-                Task {
-                    // 视频先拷到临时目录再交给播放源（AVAssetReader 需要本地文件 URL）
-                    guard let data = try? await item.loadTransferable(type: Data.self) else { return }
-                    let url = FileManager.default.temporaryDirectory
-                        .appendingPathComponent("cast-video-\(UUID().uuidString).mp4")
-                    do {
-                        try data.write(to: url)
-                    } catch {
-                        await MainActor.run { scanSummary = "视频保存失败：\(error.localizedDescription)" }
-                        return
-                    }
-                    await MainActor.run {
-                        pendingVideoURL = url
-                        videoConfirmed = false   // 新视频必须重新确认
-                    }
+        }
+        .onChange(of: pickedVideoItem) { item in
+            guard let item else { return }
+            Task {
+                guard let data = try? await item.loadTransferable(type: Data.self) else { return }
+                let url = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("cast-video-\(UUID().uuidString).mp4")
+                do {
+                    try data.write(to: url)
+                } catch {
+                    await MainActor.run { scanSummary = "视频保存失败：\(error.localizedDescription)" }
+                    return
+                }
+                await MainActor.run {
+                    pendingVideoURL = url
+                    videoConfirmed = false
                 }
             }
-            .onChange(of: sourceIndex) { _ in applySource() }
-            .onChange(of: rotationIndex) { _ in applySource() }
-            .onChange(of: cameraPositionIndex) { _ in
-                if sourceIndex == 3 { applySource() }
-            }
-            .sheet(isPresented: $showImagePreview) {
-                imagePreviewSheet
-            }
+        }
+        .onChange(of: sourceIndex) { _ in applySource() }
+        .onChange(of: rotationIndex) { _ in applySource() }
+        .onChange(of: cameraPositionIndex) { _ in
+            if sourceIndex == 3 { applySource() }
         }
     }
 
-    // MARK: - 顶部版本横幅（装没装对包，一眼分辨）
-    private var versionBanner: some View {
-        Section {
-            HStack {
-                Text("v\(AppVersion.short) (\(AppVersion.build))")
-                    .font(.title2)
-                    .bold()
-                    .monospacedDigit()
-                Spacer()
-                Text("低于 0.14 = 旧包")
-                    .font(.footnote)
-                    .foregroundColor(.secondary)
-            }
-        }
+    // MARK: - 背景
+    private var backgroundGradient: some View {
+        LinearGradient(
+            colors: scheme == .dark
+                ? [Color(red: 0.06, green: 0.07, blue: 0.10), Color(red: 0.10, green: 0.11, blue: 0.16)]
+                : [Color(red: 0.96, green: 0.97, blue: 1.0), Color(red: 0.93, green: 0.94, blue: 0.98)],
+            startPoint: .top, endPoint: .bottom)
     }
 
-    // MARK: - 连接设置
-    private var connectionSection: some View {
-        Section("仪表连接") {
-            Picker("预设", selection: $presetIndex) {
-                ForEach(Array(DashboardPreset.all.enumerated()), id: \.element.id) { index, preset in
-                    Text(preset.title).tag(index)
+    // MARK: - 顶部
+    private var header: some View {
+        HStack(alignment: .top) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Ninebot Cast")
+                    .font(.system(size: 28, weight: .bold, design: .rounded))
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(engine.isRunning ? Color.green : Color.secondary.opacity(0.5))
+                        .frame(width: 7, height: 7)
+                    Text(engine.statusText)
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
                 }
             }
-            TextField("仪表 IP", text: $host)
-                .keyboardType(.decimalPad)
-                .autocorrectionDisabled()
-            Text("本机 Wi-Fi 地址：\(localIP)")
-                .font(.footnote)
+            Spacer()
+            Text("v\(AppVersion.short)")
+                .font(.caption.weight(.semibold))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(Capsule().fill(Color.primary.opacity(0.06)))
                 .foregroundColor(.secondary)
+        }
+        .padding(.top, 8)
+        .padding(.bottom, 2)
+    }
 
-            DisclosureGroup("①②③ 找仪表 IP（扫不到先看这里）", isExpanded: $showPrereq) {
-                Text("关键前提：仪表必须已由九号自己的巡航逻辑进入投屏接收态（官方 App 车辆页 → 仪表投屏导航 → 投屏导航，等仪表出地图）。然后从后台强退九号出行（上滑划掉）——它活着就会占住本机 5012/5013 端口并持续心跳，我们的包根本发不出去（状态里出现「端口被占」就是这种情况）。iPhone 连上仪表热点后，IP 填热点详情页「路由器」那行，别填本机地址。")
-                    .font(.footnote)
+    // MARK: - 卡片容器
+    private func card<Content: View>(_ title: String,
+                                     icon: String,
+                                     @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 7) {
+                Image(systemName: icon)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(accent)
+                Text(title)
+                    .font(.subheadline.weight(.semibold))
                     .foregroundColor(.secondary)
+            }
+            content()
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(scheme == .dark ? Color.white.opacity(0.055) : Color.white)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .stroke(Color.primary.opacity(scheme == .dark ? 0.07 : 0.05), lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(scheme == .dark ? 0 : 0.04), radius: 10, y: 4)
+    }
 
+    private func fieldBackground(_ selected: Bool) -> some View {
+        RoundedRectangle(cornerRadius: 12, style: .continuous)
+            .fill(selected ? accent.opacity(0.12) : Color.primary.opacity(0.045))
+    }
+
+    // MARK: - 连接
+    private var connectionCard: some View {
+        card("仪表连接", icon: "antenna.radiowaves.left.and.right") {
+            HStack {
+                Text("预设").foregroundColor(.secondary)
+                Spacer()
+                Picker("", selection: $presetIndex) {
+                    ForEach(Array(DashboardPreset.all.enumerated()), id: \.element.id) { index, preset in
+                        Text(preset.title).tag(index)
+                    }
+                }
+                .pickerStyle(.menu)
+                .labelsHidden()
+            }
+            .font(.subheadline)
+
+            HStack(spacing: 10) {
+                Image(systemName: "network")
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundColor(.secondary)
+                TextField("仪表 IP", text: $host)
+                    .keyboardType(.decimalPad)
+                    .autocorrectionDisabled()
+                    .font(.body.monospacedDigit())
                 Button {
                     fillGateway()
                 } label: {
-                    Label("① 填入网关 .1（热点由车机发 DHCP，网关通常就是它）",
-                          systemImage: "1.circle")
+                    Text("用网关")
+                        .font(.caption.weight(.semibold))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(Capsule().fill(accent.opacity(0.12)))
+                        .foregroundColor(accent)
                 }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 11)
+            .background(fieldBackground(false))
+
+            HStack {
+                Text("本机 \(localIP)")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Spacer()
                 Button {
-                    runProbe()
+                    showTools = true
                 } label: {
-                    Label(probing ? "体检中…" : "② 体检当前 IP（TCP 端口 + RTCP 5013）",
-                          systemImage: "2.circle")
+                    HStack(spacing: 4) {
+                        Text("找不到 IP？")
+                        Image(systemName: "chevron.right").font(.system(size: 9, weight: .bold))
+                    }
+                    .font(.caption.weight(.medium))
+                    .foregroundColor(accent)
                 }
-                .disabled(probing)
-                Button {
-                    runTcpScan()
-                } label: {
-                    Label(tcpScanning ? "端口扫描中…（约 8 秒）" : "③ 扫全段端口（8443/80/443/5000…）",
-                          systemImage: "3.circle")
-                }
-                .disabled(tcpScanning)
-                Button {
-                    runScan()
-                } label: {
-                    Label(scanning ? "RTCP 扫描中…（约 2 秒）" : "扫全段 RTCP 5013（需仪表在接收态）",
-                          systemImage: "dot.radiowaves.left.and.right")
-                }
-                .disabled(scanning)
-                if !scanSummary.isEmpty {
-                    Text(scanSummary)
-                        .font(.footnote)
-                        .monospaced()
-                }
+                .buttonStyle(.plain)
             }
         }
     }
 
-    // MARK: - 画面来源（预览确认制）
-    private var sourceSection: some View {
-        Section("画面来源") {
-            Picker("来源", selection: $sourceIndex) {
-                Text("测试图").tag(0)
-                Text("图片").tag(1)
-                Text("视频").tag(2)
-                Text("摄像头").tag(3)
+    // MARK: - 画面来源
+    private var sourceCard: some View {
+        card("画面来源", icon: "rectangle.on.rectangle") {
+            HStack(spacing: 8) {
+                sourceTile(0, "测试图", "chart.bar.doc.horizontal")
+                sourceTile(1, "图片", "photo")
+                sourceTile(2, "视频", "video")
+                sourceTile(3, "摄像头", "camera")
             }
-            .pickerStyle(.segmented)
-            Picker("方向", selection: $rotationIndex) {
-                Text("0°").tag(0)
-                Text("90°").tag(1)
-                Text("180°").tag(2)
-                Text("270°").tag(3)
-            }
-            .pickerStyle(.segmented)
+
+            rotationPicker
 
             if sourceIndex == 1 {
                 photoFlow
@@ -206,37 +264,95 @@ struct MainView: View {
             } else if sourceIndex == 3 {
                 cameraFlow
             } else {
-                Text("内置测试图：彩条 + 移动方块，用于验证链路是否通。")
-                    .font(.footnote)
+                Text("彩条 + 移动方块，用来快速验证链路是否通。")
+                    .font(.caption)
                     .foregroundColor(.secondary)
             }
         }
     }
 
+    private func sourceTile(_ index: Int, _ title: String, _ icon: String) -> some View {
+        Button {
+            sourceIndex = index
+        } label: {
+            VStack(spacing: 7) {
+                Image(systemName: icon)
+                    .font(.system(size: 19, weight: .medium))
+                Text(title)
+                    .font(.caption.weight(.medium))
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 13)
+            .foregroundColor(sourceIndex == index ? accent : Color.secondary)
+            .background(fieldBackground(sourceIndex == index))
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(sourceIndex == index ? accent.opacity(0.55) : Color.clear, lineWidth: 1.2)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var rotationPicker: some View {
+        HStack(spacing: 8) {
+            Text("方向")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            Spacer()
+            HStack(spacing: 2) {
+                ForEach(0..<4, id: \.self) { i in
+                    Button {
+                        rotationIndex = i
+                    } label: {
+                        Text(["0°", "90°", "180°", "270°"][i])
+                            .font(.caption.weight(.medium))
+                            .monospacedDigit()
+                            .frame(width: 46, height: 28)
+                            .background(
+                                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                    .fill(rotationIndex == i ? accent : Color.clear)
+                            )
+                            .foregroundColor(rotationIndex == i ? .white : .secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(3)
+            .background(RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color.primary.opacity(0.045)))
+        }
+    }
+
     // 图片流程：选 → 预览 → 确认 → 才真正投
     private var photoFlow: some View {
-        Group {
+        VStack(alignment: .leading, spacing: 12) {
             PhotosPicker(selection: $pickedItem, matching: .images) {
                 Label(confirmedImage == nil ? "选择图片" : "换一张图片",
                       systemImage: "photo.on.rectangle.angled")
+                    .font(.subheadline.weight(.medium))
+                    .foregroundColor(accent)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 11)
+                    .background(fieldBackground(false))
             }
+            .buttonStyle(.plain)
+
             if let pendingImage, !imageConfirmed {
-                // 待确认：大图预览 + 确认按钮
                 Button {
                     showImagePreview = true
                 } label: {
                     previewImageView(pendingImage)
-                        .frame(height: 180)
+                        .frame(height: 170)
                         .frame(maxWidth: .infinity)
                         .clipped()
-                        .cornerRadius(8)
+                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                         .overlay(alignment: .topTrailing) {
-                            Text("待确认 · 点开预览")
-                                .font(.caption2.bold())
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4)
-                                .background(.thinMaterial, in: Capsule())
-                                .padding(8)
+                            Text("点开预览")
+                                .font(.caption2.weight(.semibold))
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 5)
+                                .background(.ultraThinMaterial, in: Capsule())
+                                .padding(9)
                         }
                 }
                 .buttonStyle(.plain)
@@ -247,19 +363,25 @@ struct MainView: View {
                     applySource()
                 } label: {
                     Label("确认投这张图", systemImage: "checkmark.circle.fill")
+                        .font(.subheadline.weight(.semibold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 11)
+                        .background(RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(accent))
+                        .foregroundColor(.white)
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(.plain)
             } else if let confirmedImage, imageConfirmed {
                 HStack(spacing: 12) {
                     previewImageView(confirmedImage)
-                        .frame(width: 96, height: 64)
+                        .frame(width: 92, height: 60)
                         .clipped()
-                        .cornerRadius(6)
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("已确认，将铺满仪表（超出部分裁掉）")
-                            .font(.footnote)
-                        Text("方向变了会自动重新铺满")
-                            .font(.caption)
+                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("已确认 · 铺满 \(DashboardPreset.all[presetIndex].width)×\(DashboardPreset.all[presetIndex].height)")
+                            .font(.caption.weight(.medium))
+                        Text("超出部分裁掉，换方向自动重排")
+                            .font(.caption2)
                             .foregroundColor(.secondary)
                     }
                     Spacer()
@@ -270,40 +392,341 @@ struct MainView: View {
 
     // 视频流程：选 → 确认 → 才真正投
     private var videoFlow: some View {
-        Group {
+        VStack(alignment: .leading, spacing: 12) {
             PhotosPicker(selection: $pickedVideoItem, matching: .videos) {
                 Label(confirmedVideoURL == nil ? "选择视频" : "换一个视频",
                       systemImage: "video.badge.plus")
+                    .font(.subheadline.weight(.medium))
+                    .foregroundColor(accent)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 11)
+                    .background(fieldBackground(false))
             }
+            .buttonStyle(.plain)
+
             if let pendingVideoURL, !videoConfirmed {
-                Text("已选 \(pendingVideoURL.lastPathComponent)，循环播放。")
-                    .font(.footnote)
+                Text(pendingVideoURL.lastPathComponent)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
                 Button {
                     confirmedVideoURL = pendingVideoURL
                     videoConfirmed = true
                     applySource()
                 } label: {
                     Label("确认投这段视频", systemImage: "checkmark.circle.fill")
+                        .font(.subheadline.weight(.semibold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 11)
+                        .background(RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(accent))
+                        .foregroundColor(.white)
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(.plain)
             } else if let confirmedVideoURL, videoConfirmed {
-                Text("已确认 \(confirmedVideoURL.lastPathComponent)，独立线程解码（不再卡顿），循环播放；方向变了自动生效。")
-                    .font(.footnote)
+                Text("已确认 · \(confirmedVideoURL.lastPathComponent)")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+            }
+            Text("原速循环播放，独立线程解码，不占发送节拍。")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+        }
+    }
+
+    private var cameraFlow: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 2) {
+                cameraTile(0, "后置", "camera")
+                cameraTile(1, "前置", "camera.rotate")
+            }
+            .padding(3)
+            .background(RoundedRectangle(cornerRadius: 13, style: .continuous)
+                .fill(Color.primary.opacity(0.045)))
+
+            Text("首次使用会请求相机权限。退后台后摄像头会停采集（iOS 限制），画面停在最后一帧但流不断。")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+        }
+    }
+
+    private func cameraTile(_ index: Int, _ title: String, _ icon: String) -> some View {
+        Button {
+            cameraPositionIndex = index
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: icon).font(.system(size: 12, weight: .medium))
+                Text(title).font(.caption.weight(.medium))
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 9)
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(cameraPositionIndex == index ? Color.primary.opacity(0.08) : Color.clear)
+            )
+            .foregroundColor(cameraPositionIndex == index ? Color.primary : Color.secondary)
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: - 指标
+    private var metricsCard: some View {
+        card("运行状态", icon: "waveform.path.ecg") {
+            HStack(spacing: 0) {
+                metric(String(engine.sentFrames), "帧已发送")
+                divider
+                metric(String(engine.sentPackets), "包已发送")
+                divider
+                metric(engine.rtcpPongCount > 0 ? "\(max(0, engine.lastRTTMs))" : "—",
+                       "往返 ms",
+                       highlight: engine.rtcpPongCount > 0)
+            }
+            HStack(spacing: 6) {
+                Image(systemName: engine.rtcpPongCount > 0 ? "checkmark.circle.fill" : "clock")
+                    .font(.system(size: 12))
+                Text(engine.rtcpPongCount > 0
+                     ? "仪表在线，已回应 \(engine.rtcpPongCount) 次心跳"
+                     : "等仪表回应心跳（2 秒以上）")
+                    .font(.caption)
+            }
+            .foregroundColor(engine.rtcpPongCount > 0 ? .green : .secondary)
+
+            if !engine.dashboardReport.isEmpty {
+                Text(engine.dashboardReport)
+                    .font(.caption)
+                    .foregroundColor(accent)
+            }
+
+            DisclosureGroup(isExpanded: $showAdvanced) {
+                VStack(spacing: 10) {
+                    Toggle("关键帧重发", isOn: $duplicateKeyframes)
+                    Toggle("分片 1400 字节", isOn: $chunk1400)
+                    Toggle("关键帧每 10 帧", isOn: $gopTen)
+                    Toggle("只发 ping（排查用）", isOn: $pingOnly)
+                }
+                .font(.subheadline)
+                .padding(.top, 8)
+            } label: {
+                Text("高级设置")
+                    .font(.caption.weight(.medium))
                     .foregroundColor(.secondary)
             }
         }
     }
 
-    private var cameraFlow: some View {
-        Group {
-            Picker("摄像头", selection: $cameraPositionIndex) {
-                Text("后置").tag(0)
-                Text("前置").tag(1)
-            }
-            .pickerStyle(.segmented)
-            Text("首次使用会弹相机权限，允许后才开始出画面。iOS 限制：退后台后摄像头会停止采集，画面停在最后一帧但流不断；图片和视频源退后台不受影响。")
-                .font(.footnote)
+    private func metric(_ value: String, _ label: String, highlight: Bool = false) -> some View {
+        VStack(spacing: 3) {
+            Text(value)
+                .font(.system(size: 22, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+                .foregroundColor(highlight ? Color.green : Color.primary)
+            Text(label)
+                .font(.caption2)
                 .foregroundColor(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private var divider: some View {
+        Rectangle()
+            .fill(Color.primary.opacity(0.07))
+            .frame(width: 1, height: 26)
+    }
+
+    // MARK: - 诊断
+    private var diagCard: some View {
+        card("诊断", icon: "stethoscope") {
+            DisclosureGroup(isExpanded: $showDiag) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(diagText)
+                        .font(.system(size: 9.5, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    HStack(spacing: 14) {
+                        Button("刷新") { diagText = Diag.tail(20) }
+                        Button("复制") {
+                            UIPasteboard.general.string = Diag.tail(60)
+                        }
+                        Spacer()
+                        Button("清空") {
+                            Diag.reset()
+                            diagText = Diag.tail(4)
+                        }
+                        .foregroundColor(.red)
+                    }
+                    .font(.caption.weight(.medium))
+                    .foregroundColor(accent)
+                }
+                .padding(.top, 8)
+            } label: {
+                Text("展开日志（出问题把这段发我）")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+        }
+    }
+
+    private var footer: some View {
+        Text("UDP 5012 视频 · 5013 心跳 · 协议对齐官方 APK")
+            .font(.caption2)
+            .foregroundColor(.secondary.opacity(0.8))
+            .padding(.top, 4)
+    }
+
+    // MARK: - 底部主按钮
+    private var actionBar: some View {
+        VStack(spacing: 10) {
+            Button {
+                if engine.isRunning {
+                    engine.stop()
+                } else {
+                    engine.start(preset: DashboardPreset.all[presetIndex],
+                                 host: host,
+                                 duplicateKeyframes: duplicateKeyframes,
+                                 packetSize: chunk1400 ? 1400 : 1380,
+                                 gop: gopTen ? 10 : Int(DashboardPreset.all[presetIndex].fps),
+                                 pingOnly: pingOnly)
+                }
+            } label: {
+                HStack(spacing: 9) {
+                    Image(systemName: engine.isRunning ? "stop.fill" : "play.fill")
+                        .font(.system(size: 15, weight: .bold))
+                    Text(engine.isRunning ? "停止投屏" : (pingOnly ? "开始（仅 ping）" : "开始投屏"))
+                        .font(.system(size: 17, weight: .semibold, design: .rounded))
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 17)
+                .background(
+                    Capsule(style: .continuous)
+                        .fill(engine.isRunning
+                              ? AnyShapeStyle(Color.red.gradient)
+                              : AnyShapeStyle(LinearGradient(colors: [accent, accent2],
+                                                             startPoint: .topLeading,
+                                                             endPoint: .bottomTrailing)))
+                )
+                .foregroundColor(.white)
+                .shadow(color: (engine.isRunning ? Color.red : accent).opacity(0.32),
+                        radius: 14, y: 7)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 20)
+        .padding(.top, 14)
+        .padding(.bottom, 10)
+        .background(
+            LinearGradient(colors: [
+                (scheme == .dark ? Color.black : Color.white).opacity(0.0),
+                (scheme == .dark ? Color(red: 0.06, green: 0.07, blue: 0.10) : Color.white).opacity(0.95)
+            ], startPoint: .top, endPoint: .bottom)
+            .ignoresSafeArea(edges: .bottom)
+        )
+    }
+
+    // MARK: - 图片预览 sheet
+    private var imagePreviewSheet: some View {
+        NavigationStack {
+            VStack(spacing: 16) {
+                if let pendingImage {
+                    previewImageView(pendingImage)
+                        .frame(maxHeight: 340)
+                        .clipped()
+                        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                        .padding(.horizontal)
+                    Text("仪表上实际显示的样子（已按 \(rotationLabel) 铺满 \(DashboardPreset.all[presetIndex].width)×\(DashboardPreset.all[presetIndex].height)，超出部分裁掉）")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal)
+                    Spacer()
+                    Button {
+                        confirmedImage = pendingImage
+                        imageConfirmed = true
+                        applySource()
+                        showImagePreview = false
+                    } label: {
+                        Label("确认投这张图", systemImage: "checkmark.circle.fill")
+                            .font(.headline)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 15)
+                            .background(Capsule().fill(LinearGradient(colors: [accent, accent2],
+                                                                     startPoint: .topLeading,
+                                                                     endPoint: .bottomTrailing)))
+                            .foregroundColor(.white)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.horizontal)
+                    .padding(.bottom, 24)
+                }
+            }
+            .navigationTitle("图片预览")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("取消") { showImagePreview = false }
+                }
+            }
+        }
+    }
+
+    private var rotationLabel: String { ["0°", "90°", "180°", "270°"][rotationIndex] }
+
+    // MARK: - 找 IP 工具 sheet
+    private var toolsSheet: some View {
+        NavigationStack {
+            List {
+                Section {
+                    Text("仪表必须已由九号自己的巡航逻辑进入投屏接收态（官方 App 车辆页 → 仪表投屏导航 → 投屏导航，等仪表出地图）。然后从后台强退九号出行——它活着会占住本机 5012/5013 端口，包根本发不出去。")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                }
+                Section("按顺序试") {
+                    Button {
+                        fillGateway()
+                    } label: {
+                        Label("填入网关 .1（热点网关通常就是车机）", systemImage: "1.circle")
+                    }
+                    Button {
+                        runProbe()
+                    } label: {
+                        Label(probing ? "体检中…" : "体检当前 IP（TCP 端口 + RTCP 5013）",
+                              systemImage: "2.circle")
+                    }
+                    .disabled(probing)
+                    Button {
+                        runScan()
+                    } label: {
+                        Label(scanning ? "RTCP 扫描中…（约 2 秒）" : "扫全段 RTCP 5013",
+                              systemImage: "3.circle")
+                    }
+                    .disabled(scanning)
+                    Button {
+                        runTcpScan()
+                    } label: {
+                        Label(tcpScanning ? "端口扫描中…（约 8 秒）" : "扫全段常见 TCP 端口",
+                              systemImage: "4.circle")
+                    }
+                    .disabled(tcpScanning)
+                }
+                if !scanSummary.isEmpty {
+                    Section("结果") {
+                        Text(scanSummary)
+                            .font(.footnote.monospaced())
+                    }
+                }
+                Section {
+                    Text("8443 只是车机常见网页端口之一，不同车型/固件不一样。真正的投屏通道只有 UDP 5012/5013。")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+            .navigationTitle("找仪表 IP")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("完成") { showTools = false }
+                }
+            }
         }
     }
 
@@ -339,134 +762,6 @@ struct MainView: View {
         return UIGraphicsImageRenderer(size: rect.size).image { _ in }
     }
 
-    // MARK: - 投屏控制
-    private var castSection: some View {
-        Section {
-            DisclosureGroup("高级设置（一般不用动）", isExpanded: $showAdvanced) {
-                Toggle("关键帧重发", isOn: $duplicateKeyframes)
-                Toggle("分片 1400 字节（关 = 1380，APK 值）", isOn: $chunk1400)
-                Toggle("关键帧每 10 帧（官方 gopSize）", isOn: $gopTen)
-                Toggle("只发 ping（不编码，用于排查）", isOn: $pingOnly)
-            }
-
-            if engine.isRunning {
-                Button(role: .destructive) {
-                    engine.stop()
-                } label: {
-                    Label("停止投屏", systemImage: "stop.fill")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-            } else {
-                Button {
-                    engine.start(preset: DashboardPreset.all[presetIndex],
-                                 host: host,
-                                 duplicateKeyframes: duplicateKeyframes,
-                                 packetSize: chunk1400 ? 1400 : 1380,
-                                 gop: gopTen ? 10 : Int(DashboardPreset.all[presetIndex].fps),
-                                 pingOnly: pingOnly)
-                } label: {
-                    Label(pingOnly ? "开始（仅 ping 排查）" : "开始投屏", systemImage: "play.rectangle.fill")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-            }
-        }
-    }
-
-    // MARK: - 状态
-    private var statusSection: some View {
-        Section("状态") {
-            Text(engine.statusText)
-            Text("已发送 \(engine.sentFrames) 帧 / \(engine.sentPackets) 包")
-                .monospacedDigit()
-            Text(engine.rtcpPongCount > 0
-                 ? "RTCP 回应 \(engine.rtcpPongCount) 次 · 往返 \(max(0, engine.lastRTTMs))ms"
-                 : "RTCP 尚无回应（等 2 秒以上）")
-                .monospacedDigit()
-                .foregroundColor(engine.rtcpPongCount > 0 ? .green : .secondary)
-            if !engine.dashboardReport.isEmpty {
-                Text(engine.dashboardReport)
-                    .font(.footnote)
-                    .foregroundColor(.blue)
-            }
-        }
-    }
-
-    // MARK: - 诊断（折叠）
-    private var diagSection: some View {
-        Section {
-            DisclosureGroup("诊断日志（出问题发这段给我）", isExpanded: $showDiag) {
-                Text(diagText)
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundColor(.secondary)
-                HStack {
-                    Button("刷新") { diagText = Diag.tail(20) }
-                    Spacer()
-                    Button("清空", role: .destructive) {
-                        Diag.reset()
-                        diagText = Diag.tail(4)
-                    }
-                }
-                .font(.footnote)
-            }
-        }
-    }
-
-    // MARK: - 脚注
-    private var footnoteSection: some View {
-        Section {
-            DisclosureGroup("协议要点（逆向自官方 APK）", isExpanded: .constant(false)) {
-                Text("视频 RTP 20 字节扩展头 · PT 32 · 1380 字节分片；时间戳毫秒 · 每帧带 SPS/PPS · 关键帧每秒 1 个；RTCP ping/pong 每秒 1 次；本机端口绑定 5012/5013；8443 只是车机常见网页端口，投屏通道只有 UDP 5012/5013。")
-                    .font(.footnote)
-                    .foregroundColor(.secondary)
-            }
-            Text("版本 \(AppVersion.display)")
-                .font(.footnote)
-                .foregroundColor(.secondary)
-        }
-    }
-
-    // MARK: - 图片预览 sheet
-    private var imagePreviewSheet: some View {
-        NavigationStack {
-            VStack(spacing: 16) {
-                if let pendingImage {
-                    previewImageView(pendingImage)
-                        .frame(maxHeight: 360)
-                        .clipped()
-                        .cornerRadius(12)
-                        .padding(.horizontal)
-                    Text("以上是仪表上实际会显示的画面（已按当前方向铺满 \(DashboardPreset.all[presetIndex].width)×\(DashboardPreset.all[presetIndex].height)，超出部分裁掉）")
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal)
-                    Spacer()
-                    Button {
-                        confirmedImage = pendingImage
-                        imageConfirmed = true
-                        applySource()
-                        showImagePreview = false
-                    } label: {
-                        Label("确认投这张图", systemImage: "checkmark.circle.fill")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .padding(.horizontal)
-                    .padding(.bottom, 24)
-                }
-            }
-            .navigationTitle("图片预览")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("取消") { showImagePreview = false }
-                }
-            }
-        }
-    }
-
     // MARK: - 来源应用逻辑（只有确认过的素材才会真正上屏）
     private func applySource() {
         let rotation = [0, 90, 180, 270][rotationIndex]
@@ -500,7 +795,7 @@ struct MainView: View {
             return
         }
         host = gateway
-        scanSummary = "已填入网关 \(gateway)（车机热点自己发 DHCP，网关通常就是它）。\n填好点「② 体检」验一下，再开始投屏。"
+        scanSummary = "已填入网关 \(gateway)（车机热点自己发 DHCP，网关通常就是它）。\n填好点「体检」验一下，再开始投屏。"
     }
 
     private func runProbe() {
@@ -549,7 +844,7 @@ struct MainView: View {
         } completion: { hits in
             tcpScanning = false
             if hits.isEmpty {
-                scanSummary = "\(prefix).0/24 没有主机开放这些端口。\n换「① 网关 .1」或「扫 RTCP 5013」试试——端口只是线索，投屏通道是 UDP 5012/5013。"
+                scanSummary = "\(prefix).0/24 没有主机开放这些端口。\n换「网关 .1」或「扫 RTCP 5013」试试——端口只是线索，投屏通道是 UDP 5012/5013。"
             } else {
                 scanSummary = hits
                     .map { "\($0.ip)  端口 \($0.ports.map { String($0) }.joined(separator: "/"))" }

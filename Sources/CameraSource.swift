@@ -130,7 +130,10 @@ final class CameraSource: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
         guard let ciContext else { return nil }
 
         let dest: CVPixelBuffer
-        if destBuffers.count < 3 || destBuffers[0].width != width || destBuffers[0].height != height {
+        let sizeMatches = !destBuffers.isEmpty
+            && CVPixelBufferGetWidth(destBuffers[0]) == width
+            && CVPixelBufferGetHeight(destBuffers[0]) == height
+        if destBuffers.count < 3 || !sizeMatches {
             guard let fresh = FrameRenderer.makeBuffer(width: width, height: height) else { return nil }
             if destBuffers.count >= 3 { destBuffers.removeAll() }
             destBuffers.append(fresh)
