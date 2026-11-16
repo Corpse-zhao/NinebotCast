@@ -112,12 +112,16 @@ final class CastEngine: ObservableObject {
         Diag.log("画面源：视频 \(url.lastPathComponent) rot=\(rotation)")
     }
 
-    /// 摄像头（铺满 + 可旋转）
+    /// 摄像头（铺满 + 可旋转）；渲染走独立线程，发送端零等待
     func useCamera(position: AVCaptureDevice.Position, rotation: Int) {
         teardownSources()
         cameraRotation = rotation
         let source = CameraSource()
-        source.start(position: position) { [weak self] error in
+        source.start(position: position,
+                     targetWidth: preset.width,
+                     targetHeight: preset.height,
+                     rotation: rotation,
+                     fps: Int(preset.fps)) { [weak self] error in
             if let error {
                 Diag.log("摄像头启动失败：\(error)")
                 DispatchQueue.main.async {
@@ -315,9 +319,8 @@ final class CastEngine: ObservableObject {
                                presentationTime: CMTime(value: frameIndex, timescale: preset.fps))
                 return
             }
-            // 摄像头：取最新帧（后台采集停止时自动停在最后一帧，流不断）
-            if let cameraSource, let buffer = cameraSource.renderedFrame(
-                width: preset.width, height: preset.height, rotation: cameraRotation) {
+            // 摄像头：直接拿渲染线程的成品（后台采集停止时自动停在最后一帧，流不断）
+            if let cameraSource, let buffer = cameraSource.renderedFrame() {
                 frameIndex &+= 1
                 encoder.encode(buffer,
                                presentationTime: CMTime(value: frameIndex, timescale: preset.fps))

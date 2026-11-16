@@ -3,42 +3,60 @@ import CoreImage
 import CoreVideo
 import Foundation
 
-/// 摄像头源：AVCaptureSession + VideoDataOutput，只保留最新一帧。
-/// produceFrame 每个节拍取最新帧渲染成仪表尺寸，摄像头帧率低于投屏帧率时
-/// 会重复上一帧，画面依然连续。
+/// 摄像头源 v2。
 ///
-/// 权限：先走 AVCaptureDevice.requestAccess，拒绝时给出可操作的提示，
-/// 不再直接动 session（v0.13 一点就闪退，多半是没请求权限就配置 session）。
-/// 每一步都打诊断日志，万一还有问题，日志能定位到具体哪一步。
-///
-/// iOS 限制：App 退后台后摄像头会停止采集（系统行为，保活救不了），
-/// 此时画面停在最后一帧，但流不会断；图片/视频源不受此限制。
+/// v0.15 在发送节拍里同步做 CI 渲染（720p→仪表尺寸），渲染+编码挤在同一线程，
+/// 一拍超时就掉帧——实测「超级卡」。v2 改成和视频源同样的架构：
+/// - 采集回调只存最新原始帧（零开销）；
+/// - 独立渲染线程按投屏帧率把最新原始帧渲染成目标尺寸
+///   （原始帧没变化就跳过，静态场景几乎零 CPU）；
+/// - 3 块目标 buffer 轮换；发送端只取渲染好的成品，零等待。
 final class CameraSource: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     private let session = AVCaptureSession()
     private let sessionQueue = DispatchQueue(label: "ninebotcast.camera")
+    private let renderQueue = DispatchQueue(label: "ninebotcast.camerarender")
     private let lock = NSLock()
-    private var latestBuffer: CVPixelBuffer?
-    private var ciContext: CIContext?
+    private var latestRaw: CVPixelBuffer?
+    private var latestRendered: CVPixelBuffer?
+    private var lastRenderedRaw: CVPixelBuffer?
     private var destBuffers: [CVPixelBuffer] = []
     private var destIndex = 0
+    private var targetWidth = 0
+    private var targetHeight = 0
+    private var rotation = 0
+    private var fps = 25
+    private var ciContext: CIContext?
+    private var renderTimer: DispatchSourceTimer?
     private var configured = false
     private(set) var active = false
 
-    /// 启动采集；err 非 nil 表示失败原因
-    func start(position: AVCaptureDevice.Position, completion: ((String?) -> Void)? = nil) {
+    /// 启动采集 + 渲染线程；err 非 nil 表示失败原因
+    func start(position: AVCaptureDevice.Position,
+               targetWidth: Int, targetHeight: Int,
+               rotation: Int, fps: Int,
+               completion: ((String?) -> Void)? = nil) {
+        self.targetWidth = targetWidth
+        self.targetHeight = targetHeight
+        self.rotation = rotation
+        self.fps = max(1, fps)
         let status = AVCaptureDevice.authorizationStatus(for: .video)
         switch status {
         case .authorized:
             sessionQueue.async { [weak self] in
                 guard let self else { return }
                 let err = self.configure(position: position)
+                if err == nil {
+                    self.startRenderLoop()
+                }
                 completion?(err)
             }
         case .notDetermined:
             Diag.log("camera: 首次使用，请求相机权限")
             AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
                 if granted {
-                    self?.start(position: position, completion: completion)
+                    self?.start(position: position, targetWidth: targetWidth,
+                                targetHeight: targetHeight, rotation: rotation,
+                                fps: fps, completion: completion)
                 } else {
                     Diag.log("camera: 相机权限被拒绝")
                     completion?("相机权限被拒绝：去 设置 > 隐私与安全性 > 相机 里打开")
@@ -53,7 +71,7 @@ final class CameraSource: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
     }
 
     private func configure(position: AVCaptureDevice.Position) -> String? {
-        Diag.log("camera: 开始配置（\(position == .front ? "前置" : "后置")）")
+        Diag.log("camera: 开始配置（\(position == .front ? "前置" : "后置")）目标 \(targetWidth)x\(targetHeight) rot=\(rotation) @\(fps)fps")
         guard !configured else { return nil }
         session.beginConfiguration()
         if session.canSetSessionPreset(.hd1280x720) {
@@ -96,8 +114,7 @@ final class CameraSource: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
         session.addOutput(output)
         Diag.log("camera: 输出 OK")
 
-        // v0.14 的闪退真凶：用 defer 在函数末尾才 commit，startRunning
-        // 恰好落在 begin/commit 之间 → NSGenericException。必须先 commit 再 start。
+        // v0.14 的闪退真凶：commit 必须发生在 startRunning 之前
         session.commitConfiguration()
         Diag.log("camera: commitConfiguration 完成，启动 session")
         session.startRunning()
@@ -107,41 +124,56 @@ final class CameraSource: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
         return nil
     }
 
-    func captureOutput(_ output: AVCaptureOutput,
-                       didOutput sampleBuffer: CMSampleBuffer,
-                       from connection: AVCaptureConnection) {
-        guard let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        lock.lock()
-        latestBuffer = pb // 持有强引用，CoreVideo 会为池补新 buffer，内容不会被覆盖
-        lock.unlock()
+    // MARK: - 独立渲染线程
+
+    private func startRenderLoop() {
+        renderQueue.async { [weak self] in
+            guard let self else { return }
+            let timer = DispatchSource.makeTimerSource(queue: self.renderQueue)
+            timer.schedule(deadline: .now(),
+                           repeating: 1.0 / Double(max(1, self.fps)))
+            timer.setEventHandler { [weak self] in self?.renderOnce() }
+            timer.resume()
+            self.renderTimer = timer
+            Diag.log("camera: 渲染线程已启动 @\(self.fps)fps")
+        }
     }
 
-    /// 取最新一帧并渲染成目标尺寸（含旋转与铺满）。
-    /// 3 块 buffer 轮换复用，不再每帧分配（v0.14 每帧 CVPixelBufferCreate 也是卡顿源）。
-    func renderedFrame(width: Int, height: Int, rotation: Int) -> CVPixelBuffer? {
+    /// 渲染线程调用：把最新原始帧渲染成目标尺寸
+    private func renderOnce() {
         lock.lock()
-        guard let raw = latestBuffer else {
-            lock.unlock()
-            return nil
-        }
+        let raw = latestRaw
         lock.unlock()
+        guard let raw else { return }
 
+        // 画面没动（同一块原始 buffer）就不重复渲染，静态场景几乎零开销
+        if raw === lastRenderedRaw, latestRendered != nil { return }
+
+        let w = targetWidth, h = targetHeight
+        guard w > 16, h > 16 else { return }
         if ciContext == nil { ciContext = CIContext(options: nil) }
-        guard let ciContext else { return nil }
+        guard let ciContext else { return }
 
+        // 3 块 buffer 轮换，避免覆盖还在编码的帧
         let dest: CVPixelBuffer
-        let sizeMatches = !destBuffers.isEmpty
-            && CVPixelBufferGetWidth(destBuffers[0]) == width
-            && CVPixelBufferGetHeight(destBuffers[0]) == height
-        if destBuffers.count < 3 || !sizeMatches {
-            guard let fresh = FrameRenderer.makeBuffer(width: width, height: height) else { return nil }
+        lock.lock()
+        let sizeOK = !destBuffers.isEmpty
+            && CVPixelBufferGetWidth(destBuffers[0]) == w
+            && CVPixelBufferGetHeight(destBuffers[0]) == h
+        if destBuffers.count < 3 || !sizeOK {
+            guard let fresh = FrameRenderer.makeBuffer(width: w, height: h) else {
+                lock.unlock()
+                return
+            }
             if destBuffers.count >= 3 { destBuffers.removeAll() }
             destBuffers.append(fresh)
+            destIndex = destBuffers.count - 1
             dest = fresh
         } else {
             destIndex = (destIndex + 1) % destBuffers.count
             dest = destBuffers[destIndex]
         }
+        lock.unlock()
 
         var ci = CIImage(cvPixelBuffer: raw)
         switch rotation {
@@ -150,21 +182,50 @@ final class CameraSource: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
         case 270: ci = ci.oriented(.left)
         default: break
         }
-        ci = FrameRenderer.aspectFillTransform(ci, destWidth: width, destHeight: height)
+        ci = FrameRenderer.aspectFillTransform(ci, destWidth: w, destHeight: h)
         ciContext.render(ci, to: dest,
-                         bounds: CGRect(x: 0, y: 0, width: width, height: height),
+                         bounds: CGRect(x: 0, y: 0, width: w, height: h),
                          colorSpace: CGColorSpaceCreateDeviceRGB())
-        return dest
+
+        lock.lock()
+        latestRendered = dest
+        lastRenderedRaw = raw
+        lock.unlock()
+    }
+
+    // MARK: - 采集回调（只存原始帧，零渲染开销）
+
+    func captureOutput(_ output: AVCaptureOutput,
+                       didOutput sampleBuffer: CMSampleBuffer,
+                       from connection: AVCaptureConnection) {
+        guard let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        lock.lock()
+        latestRaw = pb
+        lock.unlock()
+    }
+
+    /// 发送线程调用：拿最新渲染好的成品（零等待）
+    func renderedFrame() -> CVPixelBuffer? {
+        lock.lock()
+        defer { lock.unlock() }
+        return latestRendered
     }
 
     func stop() {
+        renderQueue.async { [weak self] in
+            guard let self else { return }
+            self.renderTimer?.cancel()
+            self.renderTimer = nil
+        }
         sessionQueue.async { [weak self] in
             guard let self, self.configured else { return }
             self.session.stopRunning()
             self.configured = false
             self.active = false
             self.lock.lock()
-            self.latestBuffer = nil
+            self.latestRaw = nil
+            self.latestRendered = nil
+            self.lastRenderedRaw = nil
             self.lock.unlock()
             Diag.log("camera: 已停止")
         }
