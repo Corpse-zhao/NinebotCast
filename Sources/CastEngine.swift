@@ -3,19 +3,19 @@ import CoreMedia
 import UIKit
 import AVFoundation
 
-/// 投屏引擎：帧定时器 → 测试图 → VideoToolbox → RTP 打包 → UDP 5012
+/// 投屏引擎：帧定时器 → 画面源 → VideoToolbox → RTP 打包 → UDP 5012
 /// RTCP ping/pong 走 UDP 5013（每 1 秒一次，20 字节，逆向自官方 APK）
 ///
-/// 与官方 Android 实现对齐的关键点：
-/// - 每帧数据 = SPS/PPS(Annex-B) + 帧数据(Annex-B)，逐字节 1380 分片
-/// - 时间戳用毫秒；关键帧每秒 1 个；关键帧可选重发一遍
-/// - 本地端口绑定 5012/5013
+/// 线程模型（v0.17 起统一）：
+/// - frameQueue：按帧率取帧 + 提交编码（背压：在飞帧过多就跳过本次）
+/// - 画面源各自的线程：解码 / 渲染成品（图片是预渲染 buffer，零开销）
+/// - videoQueue：RTP 打包 + **限流发送**（每毫秒最多 2 个包），避免运动画面
+///   一瞬间几十个包砸过去把仪表网卡打丢
+/// - callbackQueue：只跑 RTCP 心跳与回包解析
 ///
-/// 防闪退相关：
-/// - 所有对 callbackQueue 的访问都走 `onSendQueue`，本身就带 specific key 检测，
-///   不会再出现「在 callbackQueue 上再 sync 自己」的自锁死
-/// - 编码器实例退役后不释放（留在 retiredEncoders 里），
-///   保证 VideoToolbox 的 refcon 指针永远有效，不会 use-after-free
+/// 为什么限流：静态图片每帧压缩后只有几百字节（1~2 包），怎么发都不卡；
+/// 一动起来每帧十几 KB（十来个包），全速连发容易在仪表侧丢包，
+/// 表现就是「图片不卡、视频/摄像头一帧一帧地播」。
 final class CastEngine: ObservableObject {
     @Published var statusText: String = "待机"
     @Published var sentFrames: Int = 0
@@ -25,8 +25,13 @@ final class CastEngine: ObservableObject {
     @Published var dashboardReport: String = ""
     @Published var localIPText: String = "-"
     @Published var isRunning: Bool = false
+    /// 实测每秒出帧数 / 平均帧大小，用来判断是编码跟不上还是链路丢了
+    @Published var measuredFps: Int = 0
+    @Published var avgFrameKB: Int = 0
+    @Published var backlogPackets: Int = 0
 
     private var preset: DashboardPreset = .fiveInch
+    private var activeFps: Int32 = 20
     private var videoChannel: UDPChannel?
     private var controlChannel: UDPChannel?
     private var encoder: H264Encoder?
@@ -35,11 +40,13 @@ final class CastEngine: ObservableObject {
     private var kcpTimer: DispatchSourceTimer?
     private var frameTimer: DispatchSourceTimer?
     private var pingTimer: DispatchSourceTimer?
+    private var pacerTimer: DispatchSourceTimer?
+    private var statTimer: DispatchSourceTimer?
     private var frameIndex: Int64 = 0
     private var encodedFrameIndex: Int64 = 0
     private var pingCounter: UInt32 = 0
     private var pingSentTimes: [UInt32: Int] = [:]
-    private var duplicateKeyframes = true
+    private var duplicateKeyframes = false
     /// 画面源：测试图 / 相册图片 / 相册视频（循环）/ 摄像头
     private var photoImage: UIImage?
     private var photoRotation = 0
@@ -47,17 +54,40 @@ final class CastEngine: ObservableObject {
     private var videoSource: VideoFrameSource?
     private var cameraSource: CameraSource?
     private var cameraRotation = 0
+    private var cameraPosition: AVCaptureDevice.Position = .back
 
     private let frameQueue = DispatchQueue(label: "ninebotcast.frames")
-    private let callbackQueue = DispatchQueue(label: "ninebotcast.send")
+    private let callbackQueue = DispatchQueue(label: "ninebotcast.rtcp")
+    private let videoQueue = DispatchQueue(label: "ninebotcast.videosend")
     private let queueKey = DispatchSpecificKey<Int>()
 
-    // RTP 打包器只在 callbackQueue 上访问
+    // 以下三项只由 videoQueue 访问
     private var packer: RTPPacker?
+    private var pendingPackets: [Data] = []
+    private var sendCursor = 0
+    private var loggedFirstFrame = false
+
+    // 背压 / 统计
+    private let inflightLock = NSLock()
+    private var inflightFrames = 0
+    private var skippedByBackpressure = 0
+    private var backlogDrops = 0
+    private var bytesWindow = 0
+    private var framesWindow = 0
+    private var packetsWindow = 0
+    private var lastSampleFrames = 0
+    private var statTicks = 0
 
     init() {
         callbackQueue.setSpecific(key: queueKey, value: 1)
     }
+
+    /// H.264 要求宽高按 16 对齐
+    private static func align16(_ v: Int) -> Int {
+        max(16, (v / 16) * 16)
+    }
+
+    // MARK: - 画面源
 
     /// 选一张相册图片当画面源；传 nil 回到测试图
     func setPhoto(_ image: UIImage?) {
@@ -102,11 +132,11 @@ final class CastEngine: ObservableObject {
         Diag.log("画面源：图片 rot=\(rotation) → \(preset.width)x\(preset.height)")
     }
 
-    /// 相册视频（循环播放，铺满 + 可旋转），独立线程解码，不阻塞发送
+    /// 相册视频（循环播放，铺满 + 可旋转），独立线程按原速解码
     func useVideo(url: URL, rotation: Int) {
         teardownSources()
         let source = VideoFrameSource(url: url, width: preset.width, height: preset.height,
-                                      rotation: rotation, fps: Int(preset.fps))
+                                      rotation: rotation, fps: Int(activeFps))
         source.start()
         videoSource = source
         Diag.log("画面源：视频 \(url.lastPathComponent) rot=\(rotation)")
@@ -116,12 +146,17 @@ final class CastEngine: ObservableObject {
     func useCamera(position: AVCaptureDevice.Position, rotation: Int) {
         teardownSources()
         cameraRotation = rotation
+        cameraPosition = position
+        startCamera()
+    }
+
+    private func startCamera() {
         let source = CameraSource()
-        source.start(position: position,
+        source.start(position: cameraPosition,
                      targetWidth: preset.width,
                      targetHeight: preset.height,
-                     rotation: rotation,
-                     fps: Int(preset.fps)) { [weak self] error in
+                     rotation: cameraRotation,
+                     fps: Int(activeFps)) { [weak self] error in
             if let error {
                 Diag.log("摄像头启动失败：\(error)")
                 DispatchQueue.main.async {
@@ -132,15 +167,21 @@ final class CastEngine: ObservableObject {
         cameraSource = source
     }
 
+    // MARK: - 启动 / 停止
+
     /// - Parameter pingOnly: 只发 RTCP ping，不建编码器、不发视频。用于隔离闪退原因。
     /// - Parameter packetSize: RTP 分片大小（官方 1400 / APK 1380）
-    /// - Parameter gop: 关键帧间隔（官方 gopSize=10）
+    /// - Parameter gop: 关键帧间隔（帧数）
+    /// - Parameter fpsOverride / bitrateOverride: 界面上的手动覆盖，0 = 跟随预设
     func start(preset: DashboardPreset,
                host: String,
                duplicateKeyframes: Bool,
                packetSize: Int = 1400,
                gop: Int = 10,
-               pingOnly: Bool = false) {
+               pingOnly: Bool = false,
+               fpsOverride: Int = 0,
+               bitrateOverride: UInt32 = 0,
+               resolutionDivisor: Int = 1) {
         guard preset.isImplemented || pingOnly else {
             statusText = "该预设未实现（JPEG 模式待开发）"
             return
@@ -150,14 +191,31 @@ final class CastEngine: ObservableObject {
             statusText = "仪表 IP 为空"
             return
         }
-        guard preset.fps > 0 else {
+
+        // 应用手动覆盖（帧率/码率/分辨率）
+        var effective = preset
+        let div = max(1, resolutionDivisor)
+        let outW = div == 1 ? preset.width : Self.align16(preset.width / div)
+        let outH = div == 1 ? preset.height : Self.align16(preset.height / div)
+        if fpsOverride > 0 || bitrateOverride > 0 || div > 1 {
+            effective = DashboardPreset(
+                id: preset.id, title: preset.title,
+                width: outW, height: outH,
+                fps: fpsOverride > 0 ? Int32(fpsOverride) : preset.fps,
+                bitrate: bitrateOverride > 0 ? bitrateOverride : preset.bitrate,
+                codec: preset.codec,
+                rtpPayloadType: preset.rtpPayloadType,
+                kcpConv: preset.kcpConv)
+        }
+        guard effective.fps > 0 else {
             statusText = "预设帧率非法"
             return
         }
 
         stop()
 
-        self.preset = preset
+        self.preset = effective
+        activeFps = effective.fps
         self.duplicateKeyframes = duplicateKeyframes
         frameIndex = 0
         encodedFrameIndex = 0
@@ -172,7 +230,7 @@ final class CastEngine: ObservableObject {
             Diag.log("start 中止：host 与本机 IP 相同 \(target)")
             return
         }
-        Diag.log("start preset=\(preset.id) host=\(target) local=\(localIP ?? "nil") pingOnly=\(pingOnly)")
+        Diag.log("start preset=\(effective.id) \(effective.width)x\(effective.height) @\(effective.fps)fps \(effective.bitrate / 1000)kbps host=\(target) local=\(localIP ?? "nil") pingOnly=\(pingOnly)")
 
         let video = UDPChannel(host: target, remotePort: 5012, localIP: localIP, localPort: 5012)
         video.start()
@@ -183,12 +241,12 @@ final class CastEngine: ObservableObject {
         controlChannel = control
 
         // 七寸：视频 RTP 包先过 KCP 再走 UDP
-        if preset.codec == .h264kcp && !pingOnly {
-            let kcp = KCPChannel(conv: preset.kcpConv) { [weak video] data in
+        if effective.codec == .h264kcp && !pingOnly {
+            let kcp = KCPChannel(conv: effective.kcpConv) { [weak video] data in
                 video?.send(data)
             }
             kcpChannel = kcp
-            let timer = DispatchSource.makeTimerSource(queue: callbackQueue)
+            let timer = DispatchSource.makeTimerSource(queue: videoQueue)
             timer.schedule(deadline: .now(), repeating: .milliseconds(10))
             timer.setEventHandler { kcp.tick() }
             timer.resume()
@@ -201,7 +259,6 @@ final class CastEngine: ObservableObject {
         video.onReceive = { [weak self] data in
             self?.handleControlReceive(data)
         }
-        // 本机 5012/5013 被九号出行占用时的降级提示（onFallback 已在主线程）
         let fallbackNote: (String) -> Void = { [weak self] note in
             self?.dashboardReport = note
             Diag.log(note)
@@ -212,8 +269,8 @@ final class CastEngine: ObservableObject {
         if !pingOnly {
             let encoder = H264Encoder()
             guard encoder.setup(
-                width: preset.width, height: preset.height,
-                fps: preset.fps, bitrate: preset.bitrate, gop: gop) else {
+                width: effective.width, height: effective.height,
+                fps: activeFps, bitrate: effective.bitrate, gop: gop) else {
                 statusText = "H.264 编码器初始化失败（看诊断日志）"
                 return
             }
@@ -222,7 +279,14 @@ final class CastEngine: ObservableObject {
             }
             self.encoder = encoder
 
-            onSendQueue { packer = RTPPacker(chunkSize: packetSize) }
+            videoQueue.sync {
+                packer = RTPPacker(chunkSize: packetSize)
+                pendingPackets.removeAll()
+                sendCursor = 0
+                loggedFirstFrame = false
+            }
+            startPacer()
+            startStats()
         }
 
         // RTCP ping：每 1 秒一次（官方节奏），计数器从 1 开始
@@ -234,9 +298,16 @@ final class CastEngine: ObservableObject {
         ping.resume()
         pingTimer = ping
 
+        // 摄像头已经开着时，帧率/尺寸变了要按新参数重来
+        if cameraSource != nil {
+            cameraSource?.stop()
+            cameraSource = nil
+            startCamera()
+        }
+
         if !pingOnly {
             let timer = DispatchSource.makeTimerSource(queue: frameQueue)
-            timer.schedule(deadline: .now(), repeating: 1.0 / Double(preset.fps))
+            timer.schedule(deadline: .now(), repeating: 1.0 / Double(activeFps))
             timer.setEventHandler { [weak self] in self?.produceFrame() }
             timer.resume()
             frameTimer = timer
@@ -246,10 +317,20 @@ final class CastEngine: ObservableObject {
         sentPackets = 0
         rtcpPongCount = 0
         lastRTTMs = -1
+        measuredFps = 0
+        avgFrameKB = 0
+        backlogPackets = 0
         dashboardReport = ""
+        skippedByBackpressure = 0
+        backlogDrops = 0
+        bytesWindow = 0
+        framesWindow = 0
+        packetsWindow = 0
+        lastSampleFrames = 0
+        statTicks = 0
         statusText = pingOnly
             ? "仅 RTCP ping → \(target):5013（不编码、不发画面）"
-            : "发送中 → \(target):5012\(localIP.map { "（本机 \($0)）" } ?? "")：\(preset.title)"
+            : "发送中 → \(target):5012\(localIP.map { "（本机 \($0)）" } ?? "")：\(effective.title)"
         isRunning = true
         BackgroundKeeper.shared.start()   // 退后台不断流（静音音频保活 + 禁止锁屏）
         Diag.log("start 完成")
@@ -259,7 +340,13 @@ final class CastEngine: ObservableObject {
         frameTimer?.cancel(); frameTimer = nil
         pingTimer?.cancel(); pingTimer = nil
         kcpTimer?.cancel(); kcpTimer = nil
-        onSendQueue { packer = nil }
+        pacerTimer?.cancel(); pacerTimer = nil
+        statTimer?.cancel(); statTimer = nil
+        videoQueue.sync {
+            packer = nil
+            pendingPackets.removeAll()
+            sendCursor = 0
+        }
         kcpChannel = nil
         isRunning = false
 
@@ -273,6 +360,9 @@ final class CastEngine: ObservableObject {
             }
         }
         self.encoder = nil
+        inflightLock.lock()
+        inflightFrames = 0
+        inflightLock.unlock()
 
         videoChannel?.stop(); videoChannel = nil
         controlChannel?.stop(); controlChannel = nil
@@ -282,9 +372,11 @@ final class CastEngine: ObservableObject {
             statusText = "已停止"
         }
         if pingCounter > 0 {
-            Diag.log("stop：累计 \(sentFrames) 帧 / \(sentPackets) 包，pong \(rtcpPongCount) 次")
+            Diag.log("stop：累计 \(sentFrames) 帧 / \(sentPackets) 包，pong \(rtcpPongCount) 次，背压跳过 \(skippedByBackpressure) 次，积压丢弃 \(backlogDrops) 次")
         }
     }
+
+    // MARK: - RTCP
 
     /// 统一走这里访问 callbackQueue：已在队列上就直接执行，不会自锁死
     private func onSendQueue(_ block: () -> Void) {
@@ -309,76 +401,168 @@ final class CastEngine: ObservableObject {
         }
     }
 
+    // MARK: - 取帧 → 编码（带背压）
+
     private func produceFrame() {
         autoreleasepool {
-            guard let encoder else { return }
-            // 视频源：拿解码线程最新产出的帧（解码独立进行，发送端零等待）
+            guard encoder != nil else { return }
+
+            inflightLock.lock()
+            let inflight = inflightFrames
+            inflightLock.unlock()
+            // 编码器已经压了 3 帧还没吐出来：这一拍直接跳过，
+            // 否则队列越积越长，仪表延迟越滚越大（表现为越投越卡）
+            if inflight >= 3 {
+                skippedByBackpressure &+= 1
+                return
+            }
+
             if let videoSource, let buffer = videoSource.latestFrame() {
-                frameIndex &+= 1
-                encoder.encode(buffer,
-                               presentationTime: CMTime(value: frameIndex, timescale: preset.fps))
+                submit(buffer)
                 return
             }
-            // 摄像头：直接拿渲染线程的成品（后台采集停止时自动停在最后一帧，流不断）
             if let cameraSource, let buffer = cameraSource.renderedFrame() {
-                frameIndex &+= 1
-                encoder.encode(buffer,
-                               presentationTime: CMTime(value: frameIndex, timescale: preset.fps))
+                submit(buffer)
                 return
             }
-            // 图片：每帧重复编码同一张
             if let photoBuffer {
-                frameIndex &+= 1
-                encoder.encode(photoBuffer,
-                               presentationTime: CMTime(value: frameIndex, timescale: preset.fps))
+                submit(photoBuffer)
                 return
             }
-            guard let pixelBuffer = TestImageSource.makeFrame(
+            if let pixelBuffer = TestImageSource.makeFrame(
                 index: frameIndex,
                 width: preset.width,
-                height: preset.height) else { return }
-            frameIndex &+= 1
-            let time = CMTime(value: frameIndex, timescale: preset.fps)
-            encoder.encode(pixelBuffer, presentationTime: time)
+                height: preset.height) {
+                submit(pixelBuffer)
+            }
         }
     }
 
+    private func submit(_ buffer: CVPixelBuffer) {
+        guard let encoder else { return }
+        inflightLock.lock()
+        inflightFrames += 1
+        inflightLock.unlock()
+        frameIndex &+= 1
+        encoder.encode(buffer, presentationTime: CMTime(value: frameIndex, timescale: activeFps))
+    }
+
+    // MARK: - 编码输出 → 打包 → 限流发送
+
     private func handleEncodedFrame(_ annexB: Data, keyframe: Bool) {
-        autoreleasepool {
-            onSendQueue {
-                // 取出 → 改动 → 写回（packetizeFrame 是 mutating，走可选链容易踩编译/语义坑）
-                guard var currentPacker = packer, !annexB.isEmpty else { return }
+        inflightLock.lock()
+        if inflightFrames > 0 { inflightFrames -= 1 }
+        inflightLock.unlock()
+        guard !annexB.isEmpty else { return }
 
-                // 时间戳：毫秒（已编码帧序号 × 1000 / fps）；用编码侧计数避免跨队列竞争
-                encodedFrameIndex &+= 1
-                let timestampMs = UInt32((encodedFrameIndex * 1000) / Int64(preset.fps))
-                let packets = currentPacker.packetizeFrame(
-                    annexB, timestampMs: timestampMs, isKeyframe: keyframe)
-                packer = currentPacker
-                guard !packets.isEmpty else { return }
+        videoQueue.async { [weak self] in
+            guard let self, var currentPacker = self.packer else { return }
 
-                let copies = (keyframe && duplicateKeyframes) ? 2 : 1
-                for _ in 0..<copies {
-                    for packet in packets {
-                        if let kcp = kcpChannel {
-                            kcp.send(packet)
-                        } else {
-                            videoChannel?.send(packet)
-                        }
-                    }
+            self.encodedFrameIndex &+= 1
+            let timestampMs = UInt32((self.encodedFrameIndex * 1000) / Int64(self.activeFps))
+            let packets = currentPacker.packetizeFrame(
+                annexB, timestampMs: timestampMs, isKeyframe: keyframe)
+            self.packer = currentPacker
+            guard !packets.isEmpty else { return }
+
+            self.bytesWindow += annexB.count
+            self.framesWindow += 1
+
+            self.compactQueueIfNeeded()
+            // 积压超过约 2 秒的量：丢掉旧包，只发最新的（宁卡不延迟）
+            if self.pendingPackets.count - self.sendCursor > 900 {
+                self.pendingPackets.removeAll(keepingCapacity: true)
+                self.sendCursor = 0
+                self.backlogDrops &+= 1
+                Diag.log("发送积压过多，丢弃旧包 \(annexB.count) 字节")
+            }
+
+            let copies = (keyframe && self.duplicateKeyframes) ? 2 : 1
+            for _ in 0..<copies {
+                self.pendingPackets.append(contentsOf: packets)
+            }
+            let packetCount = packets.count * copies
+            DispatchQueue.main.async {
+                self.sentFrames += 1
+                self.sentPackets += packetCount
+            }
+
+            if !self.loggedFirstFrame {
+                self.loggedFirstFrame = true
+                Diag.log("首帧已发：\(annexB.count) 字节 → \(packets.count) 包 key=\(keyframe)")
+            }
+        }
+    }
+
+    /// 回收已发完的前缀，避免数组无限增长
+    private func compactQueueIfNeeded() {
+        guard sendCursor > 256 else { return }
+        if sendCursor >= pendingPackets.count {
+            pendingPackets.removeAll(keepingCapacity: true)
+        } else {
+            pendingPackets.removeFirst(sendCursor)
+        }
+        sendCursor = 0
+    }
+
+    /// 每毫秒最多发 2 个包（≈2000 pps 上限），把运动画面的突发摊平
+    private func startPacer() {
+        let timer = DispatchSource.makeTimerSource(queue: videoQueue)
+        timer.schedule(deadline: .now() + 0.001, repeating: .milliseconds(1),
+                       leeway: .microseconds(200))
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            var sent = 0
+            while sent < 2, self.sendCursor < self.pendingPackets.count {
+                let packet = self.pendingPackets[self.sendCursor]
+                self.sendCursor += 1
+                sent += 1
+                self.packetsWindow += 1
+                if let kcp = self.kcpChannel {
+                    kcp.send(packet)
+                } else {
+                    self.videoChannel?.send(packet)
                 }
+            }
+            self.compactQueueIfNeeded()
+        }
+        timer.resume()
+        pacerTimer = timer
+    }
 
-                let frameBytes = annexB.count
-                let packetCount = packets.count * copies
+    /// 每秒统计一次：真实出帧率、平均帧大小、积压量
+    private func startStats() {
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.main)
+        timer.schedule(deadline: .now() + 1, repeating: .seconds(1))
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.measuredFps = max(0, self.sentFrames - self.lastSampleFrames)
+            self.lastSampleFrames = self.sentFrames
+            self.videoQueue.async {
+                let frames = self.framesWindow
+                let bytes = self.bytesWindow
+                let packets = self.packetsWindow
+                let backlog = self.pendingPackets.count - self.sendCursor
+                self.framesWindow = 0
+                self.bytesWindow = 0
+                self.packetsWindow = 0
+                self.inflightLock.lock()
+                let inflight = self.inflightFrames
+                let skipped = self.skippedByBackpressure
+                self.inflightLock.unlock()
                 DispatchQueue.main.async {
-                    self.sentFrames += 1
-                    self.sentPackets += packetCount
-                    if self.sentFrames == 1 {
-                        Diag.log("首帧已发：\(frameBytes) 字节 → \(packetCount) 包 key=\(keyframe)")
+                    self.avgFrameKB = frames > 0 ? bytes / frames / 1024 : 0
+                    self.backlogPackets = backlog
+                    self.statTicks += 1
+                    // 每 5 秒写一行诊断，够看又不刷屏
+                    if self.statTicks % 5 == 0 {
+                        Diag.log("统计 fps=\(self.measuredFps) 帧均=\(self.avgFrameKB)KB 包=\(packets)/s 积压=\(backlog) 在飞=\(inflight) 背压跳过=\(skipped)")
                     }
                 }
             }
         }
+        timer.resume()
+        statTimer = timer
     }
 
     private func handleControlReceive(_ data: Data) {

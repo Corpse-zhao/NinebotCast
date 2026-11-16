@@ -19,9 +19,12 @@ struct MainView: View {
 
     @State private var presetIndex = 0
     @State private var host = "192.168.1.13"
-    @State private var duplicateKeyframes = true
+    @State private var duplicateKeyframes = false
     @State private var chunk1400 = true
-    @State private var gopTen = true
+    @State private var gopIndex = 10            // 关键帧间隔（帧）
+    @State private var fpsIndex = 15            // 0 = 跟随预设；默认先给 15fps 求稳
+    @State private var bitrateIndex = 600       // kbps；0 = 跟随预设
+    @State private var resolutionIndex = 0      // 0 预设 / 2 一半
     @State private var pingOnly = false
     @State private var showTools = false
     @State private var showAdvanced = false
@@ -482,6 +485,16 @@ struct MainView: View {
                        "往返 ms",
                        highlight: engine.rtcpPongCount > 0)
             }
+            if engine.isRunning {
+                HStack(spacing: 0) {
+                    metric("\(engine.measuredFps)", "实测 fps")
+                    divider
+                    metric("\(engine.avgFrameKB)", "帧均 KB")
+                    divider
+                    metric("\(engine.backlogPackets)", "待发积压",
+                           warn: engine.backlogPackets > 120)
+                }
+            }
             HStack(spacing: 6) {
                 Image(systemName: engine.rtcpPongCount > 0 ? "checkmark.circle.fill" : "clock")
                     .font(.system(size: 12))
@@ -499,28 +512,81 @@ struct MainView: View {
             }
 
             DisclosureGroup(isExpanded: $showAdvanced) {
-                VStack(spacing: 10) {
-                    Toggle("关键帧重发", isOn: $duplicateKeyframes)
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("运动画面卡顿时，先降帧率和码率试")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                    HStack {
+                        Text("帧率").font(.subheadline)
+                        Spacer()
+                        Picker("", selection: $fpsIndex) {
+                            Text("跟随预设").tag(0)
+                            Text("10").tag(10)
+                            Text("15").tag(15)
+                            Text("20").tag(20)
+                            Text("25").tag(25)
+                        }
+                        .pickerStyle(.menu)
+                        .labelsHidden()
+                    }
+                    HStack {
+                        Text("码率").font(.subheadline)
+                        Spacer()
+                        Picker("", selection: $bitrateIndex) {
+                            Text("跟随预设").tag(0)
+                            Text("400k").tag(400)
+                            Text("600k").tag(600)
+                            Text("800k").tag(800)
+                            Text("1.2M").tag(1200)
+                            Text("2M").tag(2000)
+                        }
+                        .pickerStyle(.menu)
+                        .labelsHidden()
+                    }
+                    HStack {
+                        Text("关键帧间隔").font(.subheadline)
+                        Spacer()
+                        Picker("", selection: $gopIndex) {
+                            Text("10 帧").tag(10)
+                            Text("25 帧").tag(25)
+                            Text("50 帧").tag(50)
+                        }
+                        .pickerStyle(.menu)
+                        .labelsHidden()
+                    }
+                    HStack {
+                        Text("分辨率").font(.subheadline)
+                        Spacer()
+                        Picker("", selection: $resolutionIndex) {
+                            Text("跟随预设").tag(0)
+                            Text("一半（更省解码）").tag(2)
+                        }
+                        .pickerStyle(.menu)
+                        .labelsHidden()
+                    }
+                    Toggle("关键帧重发（更稳但更占带宽）", isOn: $duplicateKeyframes)
+                        .font(.subheadline)
                     Toggle("分片 1400 字节", isOn: $chunk1400)
-                    Toggle("关键帧每 10 帧", isOn: $gopTen)
+                        .font(.subheadline)
                     Toggle("只发 ping（排查用）", isOn: $pingOnly)
+                        .font(.subheadline)
                 }
-                .font(.subheadline)
                 .padding(.top, 8)
             } label: {
-                Text("高级设置")
+                Text("发送参数 · \(fpsLabel) / \(bitrateLabel)")
                     .font(.caption.weight(.medium))
                     .foregroundColor(.secondary)
             }
         }
     }
 
-    private func metric(_ value: String, _ label: String, highlight: Bool = false) -> some View {
+    private func metric(_ value: String, _ label: String,
+                        highlight: Bool = false, warn: Bool = false) -> some View {
         VStack(spacing: 3) {
             Text(value)
                 .font(.system(size: 22, weight: .semibold, design: .rounded))
                 .monospacedDigit()
-                .foregroundColor(highlight ? Color.green : Color.primary)
+                .foregroundColor(warn ? Color.orange : (highlight ? Color.green : Color.primary))
             Text(label)
                 .font(.caption2)
                 .foregroundColor(.secondary)
@@ -533,6 +599,9 @@ struct MainView: View {
             .fill(Color.primary.opacity(0.07))
             .frame(width: 1, height: 26)
     }
+
+    private var fpsLabel: String { fpsIndex == 0 ? "预设帧率" : "\(fpsIndex)fps" }
+    private var bitrateLabel: String { bitrateIndex == 0 ? "预设码率" : "\(bitrateIndex)kbps" }
 
     // MARK: - 诊断
     private var diagCard: some View {
@@ -585,8 +654,11 @@ struct MainView: View {
                                  host: host,
                                  duplicateKeyframes: duplicateKeyframes,
                                  packetSize: chunk1400 ? 1400 : 1380,
-                                 gop: gopTen ? 10 : Int(DashboardPreset.all[presetIndex].fps),
-                                 pingOnly: pingOnly)
+                                 gop: gopIndex,
+                                 pingOnly: pingOnly,
+                                 fpsOverride: fpsIndex,
+                                 bitrateOverride: UInt32(max(0, bitrateIndex) * 1000),
+                                 resolutionDivisor: resolutionIndex == 0 ? 1 : 2)
                 }
             } label: {
                 HStack(spacing: 9) {
