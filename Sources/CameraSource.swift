@@ -19,6 +19,8 @@ final class CameraSource: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
     private let lock = NSLock()
     private var latestBuffer: CVPixelBuffer?
     private var ciContext: CIContext?
+    private var destBuffers: [CVPixelBuffer] = []
+    private var destIndex = 0
     private var configured = false
     private(set) var active = false
 
@@ -57,10 +59,10 @@ final class CameraSource: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
         if session.canSetSessionPreset(.hd1280x720) {
             session.sessionPreset = .hd1280x720
         }
-        defer { session.commitConfiguration() }
 
         guard let device = AVCaptureDevice.default(
             .builtInWideAngleCamera, for: .video, position: position) else {
+            session.commitConfiguration()
             Diag.log("camera: 找不到摄像头设备")
             return "没有找到\(position == .front ? "前置" : "后置")摄像头"
         }
@@ -68,11 +70,13 @@ final class CameraSource: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
         do {
             let input = try AVCaptureDeviceInput(device: device)
             guard session.canAddInput(input) else {
+                session.commitConfiguration()
                 Diag.log("camera: canAddInput false")
                 return "摄像头输入添加失败"
             }
             session.addInput(input)
         } catch {
+            session.commitConfiguration()
             Diag.log("camera: 输入创建异常 \(error.localizedDescription)")
             return "摄像头输入创建失败：\(error.localizedDescription)"
         }
@@ -85,11 +89,17 @@ final class CameraSource: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
         output.alwaysDiscardsLateVideoFrames = true
         output.setSampleBufferDelegate(self, queue: sessionQueue)
         guard session.canAddOutput(output) else {
+            session.commitConfiguration()
             Diag.log("camera: canAddOutput false")
             return "摄像头输出添加失败"
         }
         session.addOutput(output)
-        Diag.log("camera: 输出 OK，启动 session")
+        Diag.log("camera: 输出 OK")
+
+        // v0.14 的闪退真凶：用 defer 在函数末尾才 commit，startRunning
+        // 恰好落在 begin/commit 之间 → NSGenericException。必须先 commit 再 start。
+        session.commitConfiguration()
+        Diag.log("camera: commitConfiguration 完成，启动 session")
         session.startRunning()
         configured = true
         active = true
@@ -106,7 +116,8 @@ final class CameraSource: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
         lock.unlock()
     }
 
-    /// 取最新一帧并渲染成目标尺寸（含旋转与铺满）
+    /// 取最新一帧并渲染成目标尺寸（含旋转与铺满）。
+    /// 3 块 buffer 轮换复用，不再每帧分配（v0.14 每帧 CVPixelBufferCreate 也是卡顿源）。
     func renderedFrame(width: Int, height: Int, rotation: Int) -> CVPixelBuffer? {
         lock.lock()
         guard let raw = latestBuffer else {
@@ -117,7 +128,18 @@ final class CameraSource: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
 
         if ciContext == nil { ciContext = CIContext(options: nil) }
         guard let ciContext else { return nil }
-        guard let dest = FrameRenderer.makeBuffer(width: width, height: height) else { return nil }
+
+        let dest: CVPixelBuffer
+        if destBuffers.count < 3 || destBuffers[0].width != width || destBuffers[0].height != height {
+            guard let fresh = FrameRenderer.makeBuffer(width: width, height: height) else { return nil }
+            if destBuffers.count >= 3 { destBuffers.removeAll() }
+            destBuffers.append(fresh)
+            dest = fresh
+        } else {
+            destIndex = (destIndex + 1) % destBuffers.count
+            dest = destBuffers[destIndex]
+        }
+
         var ci = CIImage(cvPixelBuffer: raw)
         switch rotation {
         case 90: ci = ci.oriented(.right)

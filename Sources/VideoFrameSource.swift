@@ -3,13 +3,16 @@ import CoreImage
 import CoreVideo
 import Foundation
 
-/// 相册视频源 v2。
+/// 相册视频源 v3。
 ///
-/// v0.13 的实现是在发送节拍里「同步解码 + 渲染 + 建新 buffer」，一帧超过 50ms
-/// 就掉帧，实测非常卡。v2 改成：
-/// - 独立解码线程按帧率持续解码「最新帧」，发送端只拿现成 buffer，互不阻塞；
-/// - 3 块目标 buffer 轮换写入，避免编码器还在处理上一帧时内容被覆盖；
-/// - 播完一轮自动循环重开。
+/// v0.14（v2）用固定 40ms 定时器解码，且让 AVAssetReader 每帧把视频转成 BGRA
+/// （这步软件转换最贵），一帧耗时超预算就掉帧——实测还是「一帧一帧播」。
+/// v3 改成：
+/// - 专用解码线程循环跑，节奏跟随视频自身时间戳（PTS 差值），原速播放，和
+///   视频帧率 / 投屏帧率无关；
+/// - 读出端直接要原生 420YpCbCr（解码器原生格式，跳过每帧 BGRA 转换），
+///   CIImage 渲染时自动做色彩矩阵转换；
+/// - 3 块目标 buffer 轮换，latestFrame() 供发送端取最新帧，互不阻塞。
 final class VideoFrameSource {
     private let url: URL
     private let width: Int
@@ -17,14 +20,13 @@ final class VideoFrameSource {
     private let rotation: Int
     private let fps: Int
     private let ciContext: CIContext
-    private let decodeQueue = DispatchQueue(label: "ninebotcast.videodecode")
-    private var decodeTimer: DispatchSourceTimer?
     private let lock = NSLock()
     private var reader: AVAssetReader?
     private var output: AVAssetReaderTrackOutput?
     private var destBuffers: [CVPixelBuffer] = []
     private var destIndex = 0
     private var latestBuffer: CVPixelBuffer?
+    private var running = false
     private(set) var failed = false
 
     init(url: URL, width: Int, height: Int, rotation: Int, fps: Int) {
@@ -37,45 +39,78 @@ final class VideoFrameSource {
     }
 
     func start() {
-        decodeQueue.async { [weak self] in
-            guard let self else { return }
-            self.lock.lock()
-            if self.reader == nil, !self.failed {
-                self.openReaderLocked()
-            }
-            self.lock.unlock()
-            guard !self.failed else { return }
-            let timer = DispatchSource.makeTimerSource(queue: self.decodeQueue)
-            timer.schedule(deadline: .now(),
-                           repeating: .milliseconds(1000 / self.fps))
-            timer.setEventHandler { [weak self] in self?.decodeOnce() }
-            timer.resume()
-            self.decodeTimer = timer
+        guard !running else { return }
+        running = true
+        let thread = Thread { [weak self] in
+            self?.decodeLoop()
         }
+        thread.name = "ninebotcast.videodecode"
+        thread.qualityOfService = .userInitiated
+        thread.start()
     }
 
-    /// 解码线程调用
-    private func decodeOnce() {
-        lock.lock()
-        defer { lock.unlock() }
-        if reader == nil || output == nil {
-            if failed { return }
-            openReaderLocked()
-            if reader == nil { return }
-        }
-        guard let sample = pullSampleLocked() else {
-            // 播完一轮：重开 reader 实现循环
-            reader?.cancelReading()
-            reader = nil
-            output = nil
-            if !failed {
-                openReaderLocked()
+    /// 解码线程主循环：解一帧 → 渲染 → 按视频 PTS 差值睡到下一帧时刻
+    private func decodeLoop() {
+        var lastPTS: Double = -1
+        while running {
+            autoreleasepool {
+                lock.lock()
+                if reader == nil || output == nil {
+                    if !failed {
+                        openReaderLocked()
+                    }
+                }
+                let sample = (reader?.status == .reading) ? output?.copyNextSampleBuffer() : nil
+                if sample == nil {
+                    // 播完一轮或 reader 失效：重开实现循环；若已 failed 则退出线程
+                    if failed {
+                        lock.unlock()
+                        running = false
+                        return
+                    }
+                    reader?.cancelReading()
+                    reader = nil
+                    output = nil
+                    openReaderLocked()
+                    if reader == nil {
+                        lock.unlock()
+                        running = false
+                        return
+                    }
+                    lastPTS = -1
+                    lock.unlock()
+                    Thread.sleep(forTimeInterval: 0.05)
+                    return
+                }
+                // 3 块 buffer 轮换，避免覆盖还在编码的帧
+                let dest: CVPixelBuffer
+                if destBuffers.count < 3 {
+                    if let fresh = FrameRenderer.makeBuffer(width: width, height: height) {
+                        destBuffers.append(fresh)
+                        dest = fresh
+                    } else {
+                        lock.unlock()
+                        return
+                    }
+                } else {
+                    destIndex = (destIndex + 1) % destBuffers.count
+                    dest = destBuffers[destIndex]
+                }
+                renderLocked(sample!, into: dest)
+                latestBuffer = dest
+                lock.unlock()
+
+                // 按 PTS 差值节奏睡：这是「原速播放」的关键
+                let pts = CMSampleBufferGetPresentationTimeStamp(sample!).seconds
+                if lastPTS >= 0, pts > lastPTS {
+                    var delta = pts - lastPTS
+                    if delta > 0.25 { delta = 0.25 }      // 掉帧后不猛追
+                    if delta < 0.005 { delta = 0.005 }    // 变帧率视频兜底
+                    Thread.sleep(forTimeInterval: delta)
+                }
+                lastPTS = pts
             }
-            return
         }
-        guard let dest = nextDestBufferLocked() else { return }
-        renderLocked(sample, into: dest)
-        latestBuffer = dest
     }
 
     /// 需已持有 lock
@@ -91,8 +126,10 @@ final class VideoFrameSource {
             failed = true
             return
         }
+        // 原生 YUV：解码器直接输出，跳过每帧 BGRA 软件转换（v2 卡顿主因）
         let trackOutput = AVAssetReaderTrackOutput(track: track, outputSettings: [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+            kCVPixelBufferPixelFormatTypeKey as String:
+                kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
         ])
         trackOutput.alwaysCopiesSampleData = false
         newReader.add(trackOutput)
@@ -104,26 +141,7 @@ final class VideoFrameSource {
         self.reader = newReader
         self.output = trackOutput
         let size = track.naturalSize
-        Diag.log("视频源已打开 \(Int(size.width))x\(Int(size.height)) → \(width)x\(height) rot=\(rotation) @\(fps)fps")
-    }
-
-    /// 需已持有 lock
-    private func pullSampleLocked() -> CMSampleBuffer? {
-        guard let output, let reader, reader.status == .reading else { return nil }
-        return output.copyNextSampleBuffer()
-    }
-
-    /// 需已持有 lock：3 块 buffer 轮换，降低分配开销也避免覆盖还在编码的帧
-    private func nextDestBufferLocked() -> CVPixelBuffer? {
-        if destBuffers.count < 3 {
-            guard let buffer = FrameRenderer.makeBuffer(width: width, height: height) else {
-                return nil
-            }
-            destBuffers.append(buffer)
-            return buffer
-        }
-        destIndex = (destIndex + 1) % destBuffers.count
-        return destBuffers[destIndex]
+        Diag.log("视频源已打开 \(Int(size.width))x\(Int(size.height)) → \(width)x\(height) rot=\(rotation) 原速PTS节奏")
     }
 
     /// 需已持有 lock
@@ -142,7 +160,7 @@ final class VideoFrameSource {
                          colorSpace: CGColorSpaceCreateDeviceRGB())
     }
 
-    /// 发送线程调用：拿最新解码好的帧（可能重复取同一帧，编码器输出码率极低）
+    /// 发送线程调用：拿最新解码好的帧（解码跟不上时重复取同一帧，画面依然连续）
     func latestFrame() -> CVPixelBuffer? {
         lock.lock()
         defer { lock.unlock() }
@@ -150,16 +168,12 @@ final class VideoFrameSource {
     }
 
     func stop() {
-        decodeQueue.async { [weak self] in
-            guard let self else { return }
-            self.decodeTimer?.cancel()
-            self.decodeTimer = nil
-            self.lock.lock()
-            self.reader?.cancelReading()
-            self.reader = nil
-            self.output = nil
-            self.latestBuffer = nil
-            self.lock.unlock()
-        }
+        running = false
+        lock.lock()
+        reader?.cancelReading()
+        reader = nil
+        output = nil
+        latestBuffer = nil
+        lock.unlock()
     }
 }
