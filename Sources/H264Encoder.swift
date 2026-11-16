@@ -64,6 +64,14 @@ final class H264Encoder {
                              value: NSNumber(value: max(1, gop))) // 官方 gopSize = 10
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering,
                              value: kCFBooleanFalse)
+        // 低延迟：编码器不许攒帧，出一帧交一帧
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxFrameDelayCount,
+                             value: NSNumber(value: 0))
+        // 码率限幅（1.25 倍均值）：不让关键帧远超均值，
+        // 大 I 帧会在发送队列里排队，排在后面的包全跟着延迟
+        let bytesPerSecond = max(1, Int(bitrate) / 8 * 5 / 4)
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits,
+                             value: "\(bytesPerSecond),1" as CFString)
 
         guard VTCompressionSessionPrepareToEncodeFrames(session) == noErr else {
             Diag.log("VTCompressionSessionPrepareToEncodeFrames 失败")

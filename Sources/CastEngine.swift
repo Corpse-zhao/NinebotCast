@@ -29,6 +29,7 @@ final class CastEngine: ObservableObject {
     @Published var measuredFps: Int = 0
     @Published var avgFrameKB: Int = 0
     @Published var backlogPackets: Int = 0
+    @Published var droppedFrames: Int = 0
 
     private var preset: DashboardPreset = .fiveInch
     private var activeFps: Int32 = 20
@@ -320,6 +321,7 @@ final class CastEngine: ObservableObject {
         measuredFps = 0
         avgFrameKB = 0
         backlogPackets = 0
+        droppedFrames = 0
         dashboardReport = ""
         skippedByBackpressure = 0
         backlogDrops = 0
@@ -469,12 +471,14 @@ final class CastEngine: ObservableObject {
             self.framesWindow += 1
 
             self.compactQueueIfNeeded()
-            // 积压超过约 2 秒的量：丢掉旧包，只发最新的（宁卡不延迟）
-            if self.pendingPackets.count - self.sendCursor > 900 {
-                self.pendingPackets.removeAll(keepingCapacity: true)
-                self.sendCursor = 0
+            // 积压明显（超过约 0.3 秒的量）：直接丢掉这一帧，不往队尾加，
+            // 加进去只会让后面所有帧都跟着多等——延迟就是这么滚起来的
+            if self.pendingPackets.count - self.sendCursor > 120 {
                 self.backlogDrops &+= 1
-                Diag.log("发送积压过多，丢弃旧包 \(annexB.count) 字节")
+                DispatchQueue.main.async {
+                    self.droppedFrames += 1
+                }
+                return
             }
 
             let copies = (keyframe && self.duplicateKeyframes) ? 2 : 1
@@ -505,15 +509,18 @@ final class CastEngine: ObservableObject {
         sendCursor = 0
     }
 
-    /// 每毫秒最多发 2 个包（≈2000 pps 上限），把运动画面的突发摊平
+    /// 每毫秒 2 包起步；有积压时自动加速（最多 10 包/毫秒）追平，
+    /// 平时保持匀速不发猛，突发时快速消化不让包排队
     private func startPacer() {
         let timer = DispatchSource.makeTimerSource(queue: videoQueue)
         timer.schedule(deadline: .now() + 0.001, repeating: .milliseconds(1),
                        leeway: .microseconds(200))
         timer.setEventHandler { [weak self] in
             guard let self else { return }
+            let backlog = self.pendingPackets.count - self.sendCursor
+            let drain = min(10, 2 + backlog / 20)
             var sent = 0
-            while sent < 2, self.sendCursor < self.pendingPackets.count {
+            while sent < drain, self.sendCursor < self.pendingPackets.count {
                 let packet = self.pendingPackets[self.sendCursor]
                 self.sendCursor += 1
                 sent += 1
@@ -543,6 +550,7 @@ final class CastEngine: ObservableObject {
                 let bytes = self.bytesWindow
                 let packets = self.packetsWindow
                 let backlog = self.pendingPackets.count - self.sendCursor
+                let drops = self.backlogDrops
                 self.framesWindow = 0
                 self.bytesWindow = 0
                 self.packetsWindow = 0
@@ -553,10 +561,11 @@ final class CastEngine: ObservableObject {
                 DispatchQueue.main.async {
                     self.avgFrameKB = frames > 0 ? bytes / frames / 1024 : 0
                     self.backlogPackets = backlog
+                    self.droppedFrames = drops + self.skippedByBackpressure
                     self.statTicks += 1
                     // 每 5 秒写一行诊断，够看又不刷屏
                     if self.statTicks % 5 == 0 {
-                        Diag.log("统计 fps=\(self.measuredFps) 帧均=\(self.avgFrameKB)KB 包=\(packets)/s 积压=\(backlog) 在飞=\(inflight) 背压跳过=\(skipped)")
+                        Diag.log("统计 fps=\(self.measuredFps) 帧均=\(self.avgFrameKB)KB 包=\(packets)/s 积压=\(backlog) 在飞=\(inflight) 背压跳过=\(skipped) 积压丢弃=\(drops)")
                     }
                 }
             }

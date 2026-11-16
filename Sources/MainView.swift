@@ -499,7 +499,9 @@ struct MainView: View {
                 Image(systemName: engine.rtcpPongCount > 0 ? "checkmark.circle.fill" : "clock")
                     .font(.system(size: 12))
                 Text(engine.rtcpPongCount > 0
-                     ? "仪表在线，已回应 \(engine.rtcpPongCount) 次心跳"
+                     ? (engine.droppedFrames > 0
+                        ? "仪表在线 · 已回应 \(engine.rtcpPongCount) 次心跳 · 主动丢 \(engine.droppedFrames) 帧"
+                        : "仪表在线，已回应 \(engine.rtcpPongCount) 次心跳")
                      : "等仪表回应心跳（2 秒以上）")
                     .font(.caption)
             }
