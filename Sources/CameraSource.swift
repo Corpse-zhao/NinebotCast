@@ -26,7 +26,7 @@ final class CameraSource: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
     private var rotation = 0
     private var fps = 25
     private var ciContext: CIContext?
-    private var renderTimer: DispatchSourceTimer?
+    private var renderInFlight = false
     private var configured = false
     private(set) var active = false
 
@@ -45,9 +45,6 @@ final class CameraSource: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
             sessionQueue.async { [weak self] in
                 guard let self else { return }
                 let err = self.configure(position: position)
-                if err == nil {
-                    self.startRenderLoop()
-                }
                 completion?(err)
             }
         case .notDetermined:
@@ -124,30 +121,14 @@ final class CameraSource: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
         return nil
     }
 
-    // MARK: - 独立渲染线程
-
-    private func startRenderLoop() {
-        renderQueue.async { [weak self] in
-            guard let self else { return }
-            let timer = DispatchSource.makeTimerSource(queue: self.renderQueue)
-            timer.schedule(deadline: .now(),
-                           repeating: 1.0 / Double(max(1, self.fps)))
-            timer.setEventHandler { [weak self] in self?.renderOnce() }
-            timer.resume()
-            self.renderTimer = timer
-            Diag.log("camera: 渲染线程已启动 @\(self.fps)fps")
-        }
-    }
+    // MARK: - 实时渲染（帧到即渲染，不靠定时器，少一层等待）
 
     /// 渲染线程调用：把最新原始帧渲染成目标尺寸
-    private func renderOnce() {
+    private func renderLatest() {
         lock.lock()
         let raw = latestRaw
         lock.unlock()
         guard let raw else { return }
-
-        // 画面没动（同一块原始 buffer）就不重复渲染，静态场景几乎零开销
-        if raw === lastRenderedRaw, latestRendered != nil { return }
 
         let w = targetWidth, h = targetHeight
         guard w > 16, h > 16 else { return }
@@ -193,7 +174,7 @@ final class CameraSource: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
         lock.unlock()
     }
 
-    // MARK: - 采集回调（只存原始帧，零渲染开销）
+    // MARK: - 采集回调：只存原始帧 + 触发渲染
 
     func captureOutput(_ output: AVCaptureOutput,
                        didOutput sampleBuffer: CMSampleBuffer,
@@ -201,7 +182,18 @@ final class CameraSource: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
         guard let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         lock.lock()
         latestRaw = pb
+        // 上一帧还在渲染就跳过这一帧；渲染完成后下一帧自然会再触发
+        let go = !renderInFlight
+        if go { renderInFlight = true }
         lock.unlock()
+        guard go else { return }
+        renderQueue.async { [weak self] in
+            guard let self else { return }
+            self.renderLatest()
+            self.lock.lock()
+            self.renderInFlight = false
+            self.lock.unlock()
+        }
     }
 
     /// 发送线程调用：拿最新渲染好的成品（零等待）
@@ -212,11 +204,6 @@ final class CameraSource: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
     }
 
     func stop() {
-        renderQueue.async { [weak self] in
-            guard let self else { return }
-            self.renderTimer?.cancel()
-            self.renderTimer = nil
-        }
         sessionQueue.async { [weak self] in
             guard let self, self.configured else { return }
             self.session.stopRunning()

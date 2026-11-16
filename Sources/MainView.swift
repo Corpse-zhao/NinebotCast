@@ -17,13 +17,15 @@ struct MainView: View {
     @StateObject private var engine = CastEngine()
     @Environment(\.colorScheme) private var scheme
 
-    @State private var presetIndex = 0
-    @State private var host = "192.168.1.13"
-    @State private var duplicateKeyframes = false
-    @State private var chunk1400 = true
-    @State private var gopIndex = 10            // 关键帧间隔（帧）
-    @State private var fpsIndex = 15            // 0 = 跟随预设；默认先给 15fps 求稳
-    @State private var bitrateIndex = 600       // kbps；0 = 跟随预设
+    // 设置持久化：下次打开不用重填
+    @AppStorage("nbc.host") private var host = ""
+    @AppStorage("nbc.preset") private var presetIndex = 0
+    @AppStorage("nbc.quality") private var qualityIndex = 2   // 0 流畅 1 均衡 2 清晰 3 极致
+    @AppStorage("nbc.dupKey") private var duplicateKeyframes = false
+    @AppStorage("nbc.chunk1400") private var chunk1400 = true
+    @State private var gopIndex = 25            // 关键帧间隔（帧）
+    @State private var fpsIndex = 20
+    @State private var bitrateIndex = 1200      // kbps
     @State private var resolutionIndex = 0      // 0 预设 / 2 一半
     @State private var pingOnly = false
     @State private var showTools = false
@@ -50,7 +52,8 @@ struct MainView: View {
     @State private var videoConfirmed = false
 
     @State private var sourceIndex = 0         // 0 测试图 1 图片 2 视频 3 摄像头
-    @State private var rotationIndex = 0       // 0/90/180/270
+    @State private var rotationIndex = 0       // 图片/视频/测试图 的方向
+    @State private var cameraRotationIndex = 1  // 摄像头默认 90°（竖装/横装常态）
     @State private var cameraPositionIndex = 0 // 0 后置 1 前置
 
     private static let previewContext = CIContext(options: nil)
@@ -79,8 +82,10 @@ struct MainView: View {
         .sheet(isPresented: $showTools) { toolsSheet }
         .onAppear {
             localIP = LanScanner.localIPv4() ?? "未连 Wi-Fi"
+            if host.isEmpty { host = LanScanner.gatewayGuess() ?? "" }
+            applyQuality(qualityIndex)
             diagText = Diag.tail(16)
-            Diag.log("MainView 出现，版本 \(AppVersion.display)")
+            Diag.log("MainView 出现，版本 \(AppVersion.display)，IP=\(host.isEmpty ? "未填" : host)")
         }
         .onChange(of: pickedItem) { item in
             guard let item else { return }
@@ -305,7 +310,7 @@ struct MainView: View {
             HStack(spacing: 2) {
                 ForEach(0..<4, id: \.self) { i in
                     Button {
-                        rotationIndex = i
+                        setRotation(step: i)
                     } label: {
                         Text(["0°", "90°", "180°", "270°"][i])
                             .font(.caption.weight(.medium))
@@ -313,9 +318,9 @@ struct MainView: View {
                             .frame(width: 46, height: 28)
                             .background(
                                 RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                    .fill(rotationIndex == i ? accent : Color.clear)
+                                    .fill(currentRotationStep == i ? accent : Color.clear)
                             )
-                            .foregroundColor(rotationIndex == i ? .white : .secondary)
+                            .foregroundColor(currentRotationStep == i ? .white : .secondary)
                     }
                     .buttonStyle(.plain)
                 }
@@ -324,6 +329,24 @@ struct MainView: View {
             .background(RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .fill(Color.primary.opacity(0.045)))
         }
+    }
+
+    /// 摄像头与其它来源各自记住自己的方向
+    private var currentRotationStep: Int {
+        sourceIndex == 3 ? cameraRotationIndex : rotationIndex
+    }
+
+    private var currentRotationDegrees: Int {
+        [0, 90, 180, 270][currentRotationStep]
+    }
+
+    private func setRotation(step: Int) {
+        if sourceIndex == 3 {
+            cameraRotationIndex = step
+        } else {
+            rotationIndex = step
+        }
+        applySource()
     }
 
     // 图片流程：选 → 预览 → 确认 → 才真正投
@@ -515,7 +538,17 @@ struct MainView: View {
 
             DisclosureGroup(isExpanded: $showAdvanced) {
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("运动画面卡顿时，先降帧率和码率试")
+                    Picker("画质", selection: $qualityIndex) {
+                        Text("流畅").tag(0)
+                        Text("均衡").tag(1)
+                        Text("清晰").tag(2)
+                        Text("极致").tag(3)
+                    }
+                    .pickerStyle(.segmented)
+                    .onChange(of: qualityIndex) { value in
+                        applyQuality(value)
+                    }
+                    Text("画质一键设好帧率和码率；下面还能单项微调")
                         .font(.caption2)
                         .foregroundColor(.secondary)
                     HStack {
@@ -604,6 +637,16 @@ struct MainView: View {
 
     private var fpsLabel: String { fpsIndex == 0 ? "预设帧率" : "\(fpsIndex)fps" }
     private var bitrateLabel: String { bitrateIndex == 0 ? "预设码率" : "\(bitrateIndex)kbps" }
+
+    /// 画质档位 = 帧率 + 码率 + GOP 的组合，一键设定
+    private func applyQuality(_ value: Int) {
+        switch value {
+        case 0: fpsIndex = 10; bitrateIndex = 400; gopIndex = 10
+        case 1: fpsIndex = 15; bitrateIndex = 800; gopIndex = 25
+        case 2: fpsIndex = 20; bitrateIndex = 1200; gopIndex = 25
+        default: fpsIndex = 25; bitrateIndex = 2000; gopIndex = 10
+        }
+    }
 
     // MARK: - 诊断
     private var diagCard: some View {
@@ -743,7 +786,7 @@ struct MainView: View {
         }
     }
 
-    private var rotationLabel: String { ["0°", "90°", "180°", "270°"][rotationIndex] }
+    private var rotationLabel: String { ["0°", "90°", "180°", "270°"][currentRotationStep] }
 
     // MARK: - 找 IP 工具 sheet
     private var toolsSheet: some View {
@@ -807,7 +850,7 @@ struct MainView: View {
     /// 按当前方向渲染「仪表上会看到的样子」
     private func previewImageView(_ image: UIImage) -> some View {
         let preset = DashboardPreset.all[presetIndex]
-        let rotation = [0, 90, 180, 270][rotationIndex]
+        let rotation = currentRotationDegrees
         let rendered = Self.renderPreview(image,
                                           rotation: rotation,
                                           width: preset.width,
@@ -838,7 +881,7 @@ struct MainView: View {
 
     // MARK: - 来源应用逻辑（只有确认过的素材才会真正上屏）
     private func applySource() {
-        let rotation = [0, 90, 180, 270][rotationIndex]
+        let rotation = currentRotationDegrees
         switch sourceIndex {
         case 0:
             engine.useTestImage()
