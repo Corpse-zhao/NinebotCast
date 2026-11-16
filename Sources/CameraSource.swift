@@ -7,7 +7,11 @@ import Foundation
 /// produceFrame 每个节拍取最新帧渲染成仪表尺寸，摄像头帧率低于投屏帧率时
 /// 会重复上一帧，画面依然连续。
 ///
-/// iOS 限制：App 退后台后摄像头会停止采集（系统行为，保活也救不了），
+/// 权限：先走 AVCaptureDevice.requestAccess，拒绝时给出可操作的提示，
+/// 不再直接动 session（v0.13 一点就闪退，多半是没请求权限就配置 session）。
+/// 每一步都打诊断日志，万一还有问题，日志能定位到具体哪一步。
+///
+/// iOS 限制：App 退后台后摄像头会停止采集（系统行为，保活救不了），
 /// 此时画面停在最后一帧，但流不会断；图片/视频源不受此限制。
 final class CameraSource: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     private let session = AVCaptureSession()
@@ -18,28 +22,62 @@ final class CameraSource: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
     private var configured = false
     private(set) var active = false
 
-    /// 启动采集；err 非 nil 表示失败原因（回调在 sessionQueue 上）
+    /// 启动采集；err 非 nil 表示失败原因
     func start(position: AVCaptureDevice.Position, completion: ((String?) -> Void)? = nil) {
-        sessionQueue.async { [weak self] in
-            guard let self else { return }
-            let err = self.configure(position: position)
-            completion?(err)
+        let status = AVCaptureDevice.authorizationStatus(for: .video)
+        switch status {
+        case .authorized:
+            sessionQueue.async { [weak self] in
+                guard let self else { return }
+                let err = self.configure(position: position)
+                completion?(err)
+            }
+        case .notDetermined:
+            Diag.log("camera: 首次使用，请求相机权限")
+            AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
+                if granted {
+                    self?.start(position: position, completion: completion)
+                } else {
+                    Diag.log("camera: 相机权限被拒绝")
+                    completion?("相机权限被拒绝：去 设置 > 隐私与安全性 > 相机 里打开")
+                }
+            }
+        case .denied, .restricted:
+            Diag.log("camera: 相机权限被拒绝/受限")
+            completion?("相机权限被拒绝：去 设置 > 隐私与安全性 > 相机 里打开")
+        @unknown default:
+            completion?("相机权限状态未知")
         }
     }
 
     private func configure(position: AVCaptureDevice.Position) -> String? {
+        Diag.log("camera: 开始配置（\(position == .front ? "前置" : "后置")）")
         guard !configured else { return nil }
         session.beginConfiguration()
+        if session.canSetSessionPreset(.hd1280x720) {
+            session.sessionPreset = .hd1280x720
+        }
         defer { session.commitConfiguration() }
+
         guard let device = AVCaptureDevice.default(
             .builtInWideAngleCamera, for: .video, position: position) else {
+            Diag.log("camera: 找不到摄像头设备")
             return "没有找到\(position == .front ? "前置" : "后置")摄像头"
         }
-        guard let input = try? AVCaptureDeviceInput(device: device),
-              session.canAddInput(input) else {
-            return "摄像头输入创建失败（权限被拒也会走到这里）"
+        Diag.log("camera: 设备 OK \(device.localizedName)")
+        do {
+            let input = try AVCaptureDeviceInput(device: device)
+            guard session.canAddInput(input) else {
+                Diag.log("camera: canAddInput false")
+                return "摄像头输入添加失败"
+            }
+            session.addInput(input)
+        } catch {
+            Diag.log("camera: 输入创建异常 \(error.localizedDescription)")
+            return "摄像头输入创建失败：\(error.localizedDescription)"
         }
-        session.addInput(input)
+        Diag.log("camera: 输入 OK")
+
         let output = AVCaptureVideoDataOutput()
         output.videoSettings = [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
@@ -47,13 +85,15 @@ final class CameraSource: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
         output.alwaysDiscardsLateVideoFrames = true
         output.setSampleBufferDelegate(self, queue: sessionQueue)
         guard session.canAddOutput(output) else {
-            return "摄像头输出创建失败"
+            Diag.log("camera: canAddOutput false")
+            return "摄像头输出添加失败"
         }
         session.addOutput(output)
+        Diag.log("camera: 输出 OK，启动 session")
         session.startRunning()
         configured = true
         active = true
-        Diag.log("摄像头已启动 \(position == .front ? "前置" : "后置")")
+        Diag.log("camera: 已启动，开始出帧")
         return nil
     }
 
@@ -101,7 +141,7 @@ final class CameraSource: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
             self.lock.lock()
             self.latestBuffer = nil
             self.lock.unlock()
-            Diag.log("摄像头已停止")
+            Diag.log("camera: 已停止")
         }
     }
 }

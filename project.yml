@@ -31,8 +31,8 @@ targets:
       path: Support/Info.plist
       properties:
         CFBundleDisplayName: Ninebot Cast
-        CFBundleShortVersionString: "0.13.0"
-        CFBundleVersion: "13"
+        CFBundleShortVersionString: "0.14.0"
+        CFBundleVersion: "14"
         UILaunchScreen: {}
         UIBackgroundModes: [audio]
         NSLocalNetworkUsageDescription: 用于连接九号仪表并发送投屏画面（UDP 5012/5013）。

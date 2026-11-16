@@ -102,11 +102,11 @@ final class CastEngine: ObservableObject {
         Diag.log("画面源：图片 rot=\(rotation) → \(preset.width)x\(preset.height)")
     }
 
-    /// 相册视频（循环播放，铺满 + 可旋转）
+    /// 相册视频（循环播放，铺满 + 可旋转），独立线程解码，不阻塞发送
     func useVideo(url: URL, rotation: Int) {
         teardownSources()
         let source = VideoFrameSource(url: url, width: preset.width, height: preset.height,
-                                      rotation: rotation)
+                                      rotation: rotation, fps: Int(preset.fps))
         source.start()
         videoSource = source
         Diag.log("画面源：视频 \(url.lastPathComponent) rot=\(rotation)")
@@ -308,8 +308,8 @@ final class CastEngine: ObservableObject {
     private func produceFrame() {
         autoreleasepool {
             guard let encoder else { return }
-            // 视频源：每拍拉一帧（循环播放）
-            if let videoSource, let buffer = videoSource.nextFrame() {
+            // 视频源：拿解码线程最新产出的帧（解码独立进行，发送端零等待）
+            if let videoSource, let buffer = videoSource.latestFrame() {
                 frameIndex &+= 1
                 encoder.encode(buffer,
                                presentationTime: CMTime(value: frameIndex, timescale: preset.fps))
