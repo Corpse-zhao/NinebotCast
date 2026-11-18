@@ -227,6 +227,29 @@ enum LanScanner {
 
     // MARK: - 单个 IP 体检
 
+    /// 轻量探测：只发一个 RTCP 心跳看有没有 pong（不做 TCP 扫描）。
+    /// 用于「自动投屏」低频轮询——仪表进入接收态后才会回包。
+    static func quickPong(ip: String, port: UInt16 = 5013, timeoutMs: Int = 700) -> Bool {
+        let fd = socket(AF_INET, SOCK_DGRAM, 0)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        setNonBlocking(fd)
+        _ = bindLocal(fd, preferredPort: port)
+        guard sendTo(fd, ip: ip, port: port, payload: RTCP.heartbeat()) else { return false }
+        let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000.0)
+        var buffer = [UInt8](repeating: 0, count: 512)
+        while Date() < deadline {
+            if let (_, bytes) = receiveFrom(fd, buffer: &buffer) {
+                if bytes.count == 20, bytes[0] == 0x85, bytes[1] == 0xCC {
+                    return true
+                }
+            } else {
+                usleep(10_000)
+            }
+        }
+        return false
+    }
+
     /// 对指定 IP 做体检：常见 TCP 端口 + RTCP ping。
     /// 用来回答「这个 IP 到底是不是仪表」，比盲扫更直接。
     static func probe(ip: String, ports: [UInt16] = commonPorts, waitMs: Int = 1200) -> ProbeResult {

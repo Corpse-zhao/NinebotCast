@@ -2,6 +2,7 @@ import SwiftUI
 import PhotosUI
 import UIKit
 import CoreImage
+import Combine
 
 enum AppVersion {
     static var short: String {
@@ -23,6 +24,7 @@ struct MainView: View {
     @AppStorage("nbc.quality") private var qualityIndex = 2   // 0 流畅 1 均衡 2 清晰 3 极致
     @AppStorage("nbc.dupKey") private var duplicateKeyframes = false
     @AppStorage("nbc.chunk1400") private var chunk1400 = true
+    @AppStorage("nbc.autoStart") private var autoStart = false
     @State private var gopIndex = 25            // 关键帧间隔（帧）
     @State private var fpsIndex = 20
     @State private var bitrateIndex = 1200      // kbps
@@ -80,6 +82,9 @@ struct MainView: View {
         .overlay(alignment: .bottom) { actionBar }
         .sheet(isPresented: $showImagePreview) { imagePreviewSheet }
         .sheet(isPresented: $showTools) { toolsSheet }
+        .onReceive(Timer.publish(every: 4, on: .main, in: .common).autoconnect()) { _ in
+            autoConnectTick()
+        }
         .onAppear {
             localIP = LanScanner.localIPv4() ?? "未连 Wi-Fi"
             if host.isEmpty { host = LanScanner.gatewayGuess() ?? "" }
@@ -250,6 +255,17 @@ struct MainView: View {
                 }
                 .buttonStyle(.plain)
             }
+
+            Toggle(isOn: $autoStart) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("自动投屏")
+                        .font(.subheadline)
+                    Text("仪表一回心跳就自动开始，不用再点按钮")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+            }
+            .tint(accent)
         }
     }
 
@@ -695,15 +711,7 @@ struct MainView: View {
                 if engine.isRunning {
                     engine.stop()
                 } else {
-                    engine.start(preset: DashboardPreset.all[presetIndex],
-                                 host: host,
-                                 duplicateKeyframes: duplicateKeyframes,
-                                 packetSize: chunk1400 ? 1400 : 1380,
-                                 gop: gopIndex,
-                                 pingOnly: pingOnly,
-                                 fpsOverride: fpsIndex,
-                                 bitrateOverride: UInt32(max(0, bitrateIndex) * 1000),
-                                 resolutionDivisor: resolutionIndex == 0 ? 1 : 2)
+                    startCasting()
                 }
             } label: {
                 HStack(spacing: 9) {
@@ -879,9 +887,41 @@ struct MainView: View {
         return UIGraphicsImageRenderer(size: rect.size).image { _ in }
     }
 
+    // MARK: - 开始投屏（手动 / 自动共用）
+
+    private func startCasting() {
+        engine.start(preset: DashboardPreset.all[presetIndex],
+                     host: host,
+                     duplicateKeyframes: duplicateKeyframes,
+                     packetSize: chunk1400 ? 1400 : 1380,
+                     gop: gopIndex,
+                     pingOnly: pingOnly,
+                     fpsOverride: fpsIndex,
+                     bitrateOverride: UInt32(max(0, bitrateIndex) * 1000),
+                     resolutionDivisor: resolutionIndex == 0 ? 1 : 2)
+    }
+
+    /// 每 4 秒探一次：仪表回心跳 = 已进入接收态 → 自动开投
+    private func autoConnectTick() {
+        guard autoStart, !engine.isRunning else { return }
+        let ip = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !ip.isEmpty, ip != localIP else { return }
+        DispatchQueue.global(qos: .utility).async {
+            let alive = LanScanner.quickPong(ip: ip)
+            guard alive else { return }
+            DispatchQueue.main.async {
+                guard autoStart, !engine.isRunning else { return }
+                startCasting()
+                if engine.isRunning {
+                    engine.dashboardReport = "自动投屏：检测到仪表已进入接收态"
+                    Diag.log("自动投屏触发 \(ip)")
+                }
+            }
+        }
+    }
+
     // MARK: - 来源应用逻辑（只有确认过的素材才会真正上屏）
-    private func applySource() {
-        let rotation = currentRotationDegrees
+    private func applySource() {        let rotation = currentRotationDegrees
         switch sourceIndex {
         case 0:
             engine.useTestImage()
