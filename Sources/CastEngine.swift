@@ -143,7 +143,7 @@ final class CastEngine: ObservableObject {
         Diag.log("画面源：视频 \(url.lastPathComponent) rot=\(rotation)")
     }
 
-    /// 摄像头（铺满 + 可旋转）；渲染走独立线程，发送端零等待
+    /// 摄像头（铺满 + 可旋转）；渲染完成直接送编码（低延迟），发送节拍不再等它
     func useCamera(position: AVCaptureDevice.Position, rotation: Int) {
         teardownSources()
         cameraRotation = rotation
@@ -153,6 +153,10 @@ final class CastEngine: ObservableObject {
 
     private func startCamera() {
         let source = CameraSource()
+        source.onRendered = { [weak self] buffer in
+            // 渲染线程直接提交编码：少一层发送节拍的等待
+            self?.submit(buffer)
+        }
         source.start(position: cameraPosition,
                      targetWidth: preset.width,
                      targetHeight: preset.height,
@@ -423,10 +427,8 @@ final class CastEngine: ObservableObject {
                 submit(buffer)
                 return
             }
-            if let cameraSource, let buffer = cameraSource.renderedFrame() {
-                submit(buffer)
-                return
-            }
+            // 摄像头走事件驱动（onRendered → submit），不在这里轮询，
+            // 否则每次节拍都白等最多一个帧间隔，延迟就是从这里多出来的
             if let photoBuffer {
                 submit(photoBuffer)
                 return

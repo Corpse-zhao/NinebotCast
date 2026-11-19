@@ -30,6 +30,9 @@ final class CameraSource: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
     private var configured = false
     private(set) var active = false
 
+    /// 渲染线程产出新帧时回调（低延迟路径：直接送编码，不等发送节拍）
+    var onRendered: ((CVPixelBuffer) -> Void)?
+
     /// 启动采集 + 渲染线程；err 非 nil 表示失败原因
     func start(position: AVCaptureDevice.Position,
                targetWidth: Int, targetHeight: Int,
@@ -123,30 +126,33 @@ final class CameraSource: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
 
     // MARK: - 实时渲染（帧到即渲染，不靠定时器，少一层等待）
 
-    /// 渲染线程调用：把最新原始帧渲染成目标尺寸
+    /// 渲染线程调用：把最新原始帧渲染成目标尺寸；有新画面就回调 onRendered
     private func renderLatest() {
         lock.lock()
         let raw = latestRaw
+        let previous = lastRenderedRaw
         lock.unlock()
         guard let raw else { return }
+        guard raw !== previous else { return }   // 画面没更新就不重复渲染
 
         let w = targetWidth, h = targetHeight
         guard w > 16, h > 16 else { return }
         if ciContext == nil { ciContext = CIContext(options: nil) }
         guard let ciContext else { return }
 
-        // 3 块 buffer 轮换，避免覆盖还在编码的帧
+        // 5 块 buffer 轮换：编码器偶尔读得慢，也不能覆盖它正在读的那块
+        // （池太小会偶发出一帧花屏，仪表上就是"闪一下"）
         let dest: CVPixelBuffer
         lock.lock()
         let sizeOK = !destBuffers.isEmpty
             && CVPixelBufferGetWidth(destBuffers[0]) == w
             && CVPixelBufferGetHeight(destBuffers[0]) == h
-        if destBuffers.count < 3 || !sizeOK {
+        if destBuffers.count < 5 || !sizeOK {
             guard let fresh = FrameRenderer.makeBuffer(width: w, height: h) else {
                 lock.unlock()
                 return
             }
-            if destBuffers.count >= 3 { destBuffers.removeAll() }
+            if destBuffers.count >= 5 { destBuffers.removeAll() }
             destBuffers.append(fresh)
             destIndex = destBuffers.count - 1
             dest = fresh
@@ -172,6 +178,8 @@ final class CameraSource: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
         latestRendered = dest
         lastRenderedRaw = raw
         lock.unlock()
+
+        onRendered?(dest)
     }
 
     // MARK: - 采集回调：只存原始帧 + 触发渲染

@@ -82,9 +82,10 @@ final class VideoFrameSource {
                     Thread.sleep(forTimeInterval: 0.05)
                     return
                 }
-                // 3 块 buffer 轮换，避免覆盖还在编码的帧
+                // 5 块 buffer 轮换：编码器偶尔读得慢也不能覆盖它正在读的那块
+                // （池太小会偶发一帧花屏，仪表上表现为"闪一下"）
                 let dest: CVPixelBuffer
-                if destBuffers.count < 3 {
+                if destBuffers.count < 5 {
                     if let fresh = FrameRenderer.makeBuffer(width: width, height: height) {
                         destBuffers.append(fresh)
                         dest = fresh
