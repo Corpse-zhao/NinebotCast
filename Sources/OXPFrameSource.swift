@@ -35,7 +35,6 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
     private var task: URLSessionWebSocketTask?
     private var formatDesc: CMVideoFormatDescription?
     private var decoderSession: VTDecompressionSession?
-    private var outputBoxCtx: UnsafeMutableRawPointer?
 
     private var destBuffers: [CVPixelBuffer] = []
     private var destIndex = 0
@@ -284,7 +283,7 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
                 CFDataCreate(nil, raw.baseAddress!.assumingMemoryBound(to: UInt8.self), raw.count)
             }
         }
-        var ptrs: [UnsafePointer<UInt8>?] = cfDatas.map { CFDataGetBytePtr($0) }
+        var ptrs: [UnsafePointer<UInt8>] = cfDatas.map { UnsafePointer<UInt8>(CFDataGetBytePtr($0)!) }
         var sizes: [Int] = cfDatas.map { CFDataGetLength($0) }
         var fmt: CMVideoFormatDescription?
         let st = CMVideoFormatDescriptionCreateFromH264ParameterSets(
@@ -292,7 +291,7 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
             parameterSetCount: 2,
             parameterSetPointers: &ptrs,
             parameterSetSizes: &sizes,
-            naluLengthFrameSize: 4,
+            nalUnitHeaderLength: 4,
             extensions: nil,
             formatDescriptionOut: &fmt)
         guard st == noErr, let fmt else {
@@ -303,28 +302,15 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
         srcWidth = w
         srcHeight = h
 
-        let box = OutputBox()
-        box.handler = { [weak self] buffer in self?.handleDecoded(buffer) }
-        let ctx = Unmanaged.passRetained(box).toOpaque()
-        outputBoxCtx = ctx
-
-        var cbRecord = VTDecompressionOutputCallbackRecord(
-            decompressionOutputCallback: { decompressionOutputRefCon, _, _, _, imageBuffer, _, _ in
-                let box = Unmanaged<OutputBox>.fromOpaque(decompressionOutputRefCon!).takeUnretainedValue()
-                box.handler?(imageBuffer)
-            },
-            decompressionOutputRefCon: ctx)
         var sessionOut: VTDecompressionSession?
         let st2 = VTDecompressionSessionCreate(
             allocator: kCFAllocatorDefault,
             formatDescription: fmt,
-            decoderSpecifications: [kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder as String: true],
+            decoderSpecification: [kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder as String: true] as CFDictionary,
             imageBufferAttributes: nil,
-            outputCallback: &cbRecord,
+            outputCallback: nil,
             decompressionSessionOut: &sessionOut)
         guard st2 == noErr, let sessionOut else {
-            Unmanaged<OutputBox>.fromOpaque(ctx).release()
-            outputBoxCtx = nil
             lock.unlock()
             Diag.log("OXP 解码会话创建失败 \(st2)")
             return
@@ -360,8 +346,13 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
         }
         var flagsOut = VTDecodeFrameFlags()
         let st = VTDecompressionSessionDecodeFrame(
-            session, sampleBuffer: sample, flags: VTDecodeFrameFlags.enableAsynchronousDecompression,
-            infoFlagsOut: &flagsOut)
+            session, sampleBuffer: sample,
+            decoderFlags: ._EnableAsynchronousDecompression,
+            infoFlagsOut: &flagsOut) { _, _, _, _, imageBuffer, _, _ in
+            if let buffer = imageBuffer {
+                self.handleDecoded(buffer)
+            }
+        }
         lock.unlock()
         if st != noErr {
             Diag.log("OXP 解码失败 \(st) key=\(isKey) size=\(payload.count)")
@@ -413,19 +404,11 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
             VTDecompressionSessionInvalidate(session)
         }
         decoderSession = nil
-        if let ctx = outputBoxCtx {
-            Unmanaged<OutputBox>.fromOpaque(ctx).release()
-        }
-        outputBoxCtx = nil
         formatDesc = nil
         receivedFirstFrame = false
     }
 
     // MARK: - 工具
-
-    private final class OutputBox {
-        var handler: ((CVPixelBuffer) -> Void)?
-    }
 
     /// 解析 avcC box 取 SPS/PPS（结构：version/profile/compat/level,
     /// lengthSizeMinusOne, numSPS, spsLen, SPS, numPPS, ppsLen, PPS）
@@ -474,7 +457,7 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
         guard st == kCMBlockBufferNoErr, let blockBuffer else { return nil }
         st = avcc.withUnsafeBytes { raw in
             CMBlockBufferReplaceDataBytes(
-                with: raw.baseAddress!, blockBuffer: blockBuffer!,
+                with: raw.baseAddress!, blockBuffer: blockBuffer,
                 offsetIntoDestination: 0, dataLength: total)
         }
         guard st == kCMBlockBufferNoErr else { return nil }
