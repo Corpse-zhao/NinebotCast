@@ -56,6 +56,10 @@ final class CastEngine: ObservableObject {
     private var cameraSource: CameraSource?
     private var cameraRotation = 0
     private var cameraPosition: AVCaptureDevice.Position = .back
+    private var oxpSource: OXPFrameSource?
+    private var oxpHost = ""
+    private var oxpPort = 9888
+    private var oxpRotation = 0
 
     private let frameQueue = DispatchQueue(label: "ninebotcast.frames")
     private let callbackQueue = DispatchQueue(label: "ninebotcast.rtcp")
@@ -110,6 +114,8 @@ final class CastEngine: ObservableObject {
         videoSource = nil
         cameraSource?.stop()
         cameraSource = nil
+        oxpSource?.stop()
+        oxpSource = nil
         photoBuffer = nil
         photoImage = nil
     }
@@ -170,6 +176,34 @@ final class CastEngine: ObservableObject {
             }
         }
         cameraSource = source
+    }
+
+    /// CarPlay（OpenXPlay / OXP）：连手机上 OpenXPlay App 的 WebSocket 拉流。
+    /// 轮询模式（latestFrame），保持发送端 fps / 时间戳节奏稳定。
+    func useCarPlay(host: String, port: Int, rotation: Int) {
+        teardownSources()
+        oxpHost = host
+        oxpPort = port
+        oxpRotation = rotation
+        startOxp()
+    }
+
+    private func startOxp() {
+        guard !oxpHost.isEmpty else {
+            Diag.log("OXP 源：地址为空，不启动")
+            return
+        }
+        let source = OXPFrameSource(host: oxpHost, port: oxpPort,
+                                    width: preset.width, height: preset.height,
+                                    rotation: oxpRotation)
+        source.onStatus = { [weak self] msg in
+            DispatchQueue.main.async {
+                self?.dashboardReport = "CarPlay：\(msg)"
+            }
+        }
+        source.start()
+        oxpSource = source
+        Diag.log("画面源：CarPlay OXP \(oxpHost):\(oxpPort) rot=\(oxpRotation) → \(preset.width)x\(preset.height)")
     }
 
     // MARK: - 启动 / 停止
@@ -309,6 +343,12 @@ final class CastEngine: ObservableObject {
             cameraSource = nil
             startCamera()
         }
+        // OXP 源同理（分辨率变了要重渲染）
+        if oxpSource != nil {
+            oxpSource?.stop()
+            oxpSource = nil
+            startOxp()
+        }
 
         if !pingOnly {
             let timer = DispatchSource.makeTimerSource(queue: frameQueue)
@@ -423,6 +463,11 @@ final class CastEngine: ObservableObject {
                 return
             }
 
+            // CarPlay（OXP）与视频同为轮询源：取最新解码帧，编码节奏保持恒定
+            if let oxpSource, let buffer = oxpSource.latestFrame() {
+                submit(buffer)
+                return
+            }
             if let videoSource, let buffer = videoSource.latestFrame() {
                 submit(buffer)
                 return

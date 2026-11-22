@@ -15,7 +15,7 @@ import urllib.request
 API = "https://api.github.com"
 SKIP_DIRS = {
     ".git", "build", ".dart_tool", ".idea", "Pods", ".symlinks", ".gradle",
-    "node_modules", ".vscode",
+    "node_modules", ".vscode", "dist", "re", "np_ref",
 }
 SKIP_EXT = {".iml", ".lock.tmp"}
 SKIP_FILES = {".flutter-plugins", ".flutter-plugins-dependencies", ".packages"}

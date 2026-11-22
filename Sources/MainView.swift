@@ -25,6 +25,8 @@ struct MainView: View {
     @AppStorage("nbc.dupKey") private var duplicateKeyframes = false
     @AppStorage("nbc.chunk1400") private var chunk1400 = true
     @AppStorage("nbc.autoStart") private var autoStart = false
+    @AppStorage("nbc.oxpHost") private var oxpHost = ""
+    @AppStorage("nbc.oxpPort") private var oxpPort = "9888"
     @State private var gopIndex = 25            // 关键帧间隔（帧）
     @State private var fpsIndex = 20
     @State private var bitrateIndex = 1200      // kbps
@@ -53,7 +55,7 @@ struct MainView: View {
     @State private var confirmedVideoURL: URL?
     @State private var videoConfirmed = false
 
-    @State private var sourceIndex = 0         // 0 测试图 1 图片 2 视频 3 摄像头
+    @State private var sourceIndex = 0         // 0 测试图 1 图片 2 视频 3 摄像头 4 CarPlay
     @State private var rotationIndex = 0       // 图片/视频/测试图 的方向
     @State private var cameraRotationIndex = 1  // 摄像头默认 90°（竖装/横装常态）
     @State private var cameraPositionIndex = 0 // 0 后置 1 前置
@@ -277,6 +279,7 @@ struct MainView: View {
                 sourceTile(1, "图片", "photo")
                 sourceTile(2, "视频", "video")
                 sourceTile(3, "摄像头", "camera")
+                sourceTile(4, "CarPlay", "car.fill")
             }
 
             rotationPicker
@@ -287,6 +290,8 @@ struct MainView: View {
                 videoFlow
             } else if sourceIndex == 3 {
                 cameraFlow
+            } else if sourceIndex == 4 {
+                carPlayFlow
             } else {
                 Text("彩条 + 移动方块，用来快速验证链路是否通。")
                     .font(.caption)
@@ -491,6 +496,57 @@ struct MainView: View {
                 .font(.caption2)
                 .foregroundColor(.secondary)
         }
+    }
+
+    // CarPlay：连手机上 OpenXPlay App 的 WebSocket 拉流
+    private var carPlayFlow: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 10) {
+                Image(systemName: "iphone.gen3.radiowaves.left.and.right")
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundColor(.secondary)
+                TextField("OpenXPlay 手机 IP", text: $oxpHost)
+                    .keyboardType(.decimalPad)
+                    .autocorrectionDisabled()
+                    .font(.body.monospacedDigit())
+                TextField("端口", text: $oxpPort)
+                    .keyboardType(.numberPad)
+                    .font(.body.monospacedDigit())
+                    .frame(width: 64)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 11)
+            .background(fieldBackground(false))
+
+            Button {
+                applySource()
+            } label: {
+                Label(oxpSourceConnected ? "重连 CarPlay" : "连接 CarPlay",
+                      systemImage: "antenna.radiowaves.left.and.right")
+                    .font(.subheadline.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 11)
+                    .background(RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(accent))
+                    .foregroundColor(.white)
+            }
+            .buttonStyle(.plain)
+            .disabled(oxpHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+            if !engine.dashboardReport.isEmpty, sourceIndex == 4 {
+                Text(engine.dashboardReport)
+                    .font(.caption)
+                    .foregroundColor(accent)
+            }
+
+            Text("前置条件：手机装 OpenXPlay App（TestFlight）→ 开 CarPlay 会话 → 本 App 与手机同一 Wi-Fi → 上面填手机 IP。连接后 CarPlay 画面（导航/音乐）会投到仪表。")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+        }
+    }
+
+    private var oxpSourceConnected: Bool {
+        engine.isRunning && sourceIndex == 4 && !engine.dashboardReport.isEmpty
     }
 
     private func cameraTile(_ index: Int, _ title: String, _ icon: String) -> some View {
@@ -940,6 +996,13 @@ struct MainView: View {
         case 3:
             engine.useCamera(position: cameraPositionIndex == 0 ? .back : .front,
                              rotation: rotation)
+        case 4:
+            let h = oxpHost.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !h.isEmpty {
+                engine.useCarPlay(host: h, port: Int(oxpPort) ?? 9888, rotation: rotation)
+            } else {
+                engine.useTestImage()
+            }
         default:
             break
         }
