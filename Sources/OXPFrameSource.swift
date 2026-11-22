@@ -309,7 +309,7 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
         outputCtx = ctx
 
         var cbRecord = VTDecompressionOutputCallbackRecord(
-            decompressionOutputCallback: { refcon, _, _, _, _, imageBuffer, _, _ in
+            decompressionOutputCallback: { refcon, _, _, _, imageBuffer, _, _ in
                 if let imageBuffer, let refcon {
                     let box = Unmanaged<DecodeBox>.fromOpaque(refcon).takeUnretainedValue()
                     box.handler(imageBuffer)
@@ -362,11 +362,12 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
             return
         }
         var infoFlags = VTDecodeInfoFlags()
+        // 该变体 iOS 9+ 就有（completionHandler 版要 iOS 17，设备是 16.x）
         let st = VTDecompressionSessionDecodeFrame(
             session, sampleBuffer: sample,
-            decoderFlags: ._EnableAsynchronousDecompression,
-            infoFlagsOut: &infoFlags,
-            refcon: nil, outputCallback: nil)
+            flags: ._EnableAsynchronousDecompression,
+            frameRefcon: nil,
+            infoFlagsOut: &infoFlags)
         lock.unlock()
         if st != noErr {
             Diag.log("OXP 解码失败 \(st) key=\(isKey) size=\(payload.count)")
