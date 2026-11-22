@@ -312,7 +312,7 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
             decompressionOutputCallback: { refcon, _, _, _, imageBuffer, _, _ in
                 if let imageBuffer, let refcon {
                     let box = Unmanaged<DecodeBox>.fromOpaque(refcon).takeUnretainedValue()
-                    box.handler(imageBuffer)
+                    box.handler?(imageBuffer)
                 }
             },
             decompressionOutputRefCon: ctx)
