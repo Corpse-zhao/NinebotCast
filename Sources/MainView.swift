@@ -539,7 +539,7 @@ struct MainView: View {
                     .foregroundColor(accent)
             }
 
-            Text("前置条件：手机装 OpenXPlay App（TestFlight）→ 开 CarPlay 会话 → 本 App 与手机同一 Wi-Fi → 上面填手机 IP。连接后 CarPlay 画面（导航/音乐）会投到仪表。")
+            Text("需要先有一个 OXP 接收端提供 CarPlay 画面：① iPhone 装 OpenXPlay App（需 iOS 17.4+）开 CarPlay 会话，填手机 IP；② iOS 16 设备用 Relay 路线——备用安卓机装 OpenXPlay-Relay 或 UFI003 小盒子，USB 连 iPhone 拿画面，填它的 IP。本 App 与接收端同一 Wi-Fi。")
                 .font(.caption2)
                 .foregroundColor(.secondary)
         }
