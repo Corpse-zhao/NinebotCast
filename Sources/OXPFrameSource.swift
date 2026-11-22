@@ -292,7 +292,6 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
             parameterSetPointers: &ptrs,
             parameterSetSizes: &sizes,
             nalUnitHeaderLength: 4,
-            extensions: nil,
             formatDescriptionOut: &fmt)
         guard st == noErr, let fmt else {
             lock.unlock()
@@ -303,10 +302,11 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
         srcHeight = h
 
         var sessionOut: VTDecompressionSession?
+        // 不强制指定硬解 key（该常量 iOS 17 才有）：系统默认优先硬解
         let st2 = VTDecompressionSessionCreate(
             allocator: kCFAllocatorDefault,
             formatDescription: fmt,
-            decoderSpecification: [kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder as String: true] as CFDictionary,
+            decoderSpecification: nil,
             imageBufferAttributes: nil,
             outputCallback: nil,
             decompressionSessionOut: &sessionOut)
@@ -344,11 +344,11 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
             lock.unlock()
             return
         }
-        var flagsOut = VTDecodeFrameFlags()
+        var infoFlags = VTDecodeInfoFlags()
         let st = VTDecompressionSessionDecodeFrame(
             session, sampleBuffer: sample,
-            decoderFlags: ._EnableAsynchronousDecompression,
-            infoFlagsOut: &flagsOut) { _, _, _, _, imageBuffer, _, _ in
+            flags: ._EnableAsynchronousDecompression,
+            infoFlagsOut: &infoFlags) { _, _, imageBuffer, _, _, _ in
             if let buffer = imageBuffer {
                 self.handleDecoded(buffer)
             }
