@@ -10,15 +10,20 @@ import Foundation
 /// - [8..14]  0
 /// - [15]     1
 /// - [16]     0
-/// - [17]     标志：0x10=帧首包 0x08=帧尾包 0x01=关键帧
-/// - [18..19] BE16(1024 | (时间戳低10位))（帧级标识）
-/// - 负载：Annex-B 原始字节流按 1380 字节切块（不按 NALU 对齐）
+/// - [17]     标志：0x10=帧首包 0x08=帧尾包 0x01=关键帧 0x02=非关键帧
+/// - [18..19] LE16(时间戳低10位)（帧级标识，官方小端、无 +1024 偏移）
+/// - 负载：Annex-B 原始字节流按分片大小切块（不按 NALU 对齐）
+///
+/// v0.23 依据官方 iOS 二进制静态逆向（xmgzxmgz/ninebot-dash-cast）修正三处：
+/// ① 分片默认 1380（20 头 + 1380 = 整包 1400，1400 载荷会凑成 1420 超部分仪表接收窗口）
+/// ② 非关键帧标志恒带 0x02（否则仪表可能按关键帧处理、参考链错乱）
+/// ③ 帧标签改小端、去掉 +1024（官方 LE16(ts & 0x3FF)）
 struct RTPPacker {
-    /// 分片大小：官方 iOS 端默认 MTU 1400，APK 逆向看到 1380，两个都要能试
-    var chunkSize: Int = 1400
+    /// 分片大小：官方整包 = 20 头 + 1380 载荷；1400 载荷留作兼容试验
+    var chunkSize: Int = 1380
     private(set) var sequence: UInt16 = 0
 
-    init(chunkSize: Int = 1400) {
+    init(chunkSize: Int = 1380) {
         self.chunkSize = chunkSize
     }
 
@@ -44,10 +49,11 @@ struct RTPPacker {
             packet[7] = UInt8(timestampMs & 0xFF)
             // [8..14] 保持 0，[15] = 1，[16] = 0
             packet[15] = 1
-            packet[17] = (isFirst ? 0x10 : 0x00) | (isKeyframe ? 0x01 : 0x00) | (isLast ? 0x08 : 0x00)
-            let frameTag = UInt16(1024 + Int(timestampMs & 1023))
-            packet[18] = UInt8(frameTag >> 8)
-            packet[19] = UInt8(frameTag & 0xFF)
+            packet[17] = (isFirst ? 0x10 : 0x00) | (isLast ? 0x08 : 0x00)
+                | (isKeyframe ? 0x01 : 0x02)
+            let frameTag = UInt16(timestampMs & 0x3FF)
+            packet[18] = UInt8(frameTag & 0xFF)
+            packet[19] = UInt8(frameTag >> 8)
             packet.replaceSubrange(20..<20 + chunkLen, with: bytes[offset..<offset + chunkLen])
             packets.append(packet)
             offset += chunkSize
@@ -85,12 +91,12 @@ enum RTCP {
     }
 
     /// 校验 pong 并取出序号。
-    /// 实测仪表回包是 85 CC 00 04 + 00000000 + 00000001 + 00000002 + 00000000，
-    /// 字段布局和 APK 里的假设不完全一致，所以这里只认「85 CC 00 04 + 长度 20」，
+    /// 实测五寸仪表回 20 字节，七寸回 24 字节——两种长度都接受（只认 85 CC 00 04 头），
     /// 不再逐字节强校验（否则明明有回应却显示"尚无回应"）。
     static func parsePong(_ data: Data) -> UInt32? {
         let b = [UInt8](data)
-        guard b.count == 20, b[0] == 0x85, b[1] == 0xCC, b[2] == 0, b[3] == 4 else {
+        guard b.count == 20 || b.count == 24,
+              b[0] == 0x85, b[1] == 0xCC, b[2] == 0, b[3] == 4 else {
             return nil
         }
         return UInt32(b[12]) | (UInt32(b[13]) << 8) | (UInt32(b[14]) << 16) | (UInt32(b[15]) << 24)

@@ -23,7 +23,7 @@ struct MainView: View {
     @AppStorage("nbc.preset") private var presetIndex = 0
     @AppStorage("nbc.quality") private var qualityIndex = 2   // 0 流畅 1 均衡 2 清晰 3 极致
     @AppStorage("nbc.dupKey") private var duplicateKeyframes = false
-    @AppStorage("nbc.chunk1400") private var chunk1400 = true
+    @AppStorage("nbc.chunk1400") private var chunk1400 = false
     @AppStorage("nbc.autoStart") private var autoStart = false
     @AppStorage("nbc.oxpHost") private var oxpHost = ""
     @AppStorage("nbc.oxpPort") private var oxpPort = "9888"
@@ -539,7 +539,7 @@ struct MainView: View {
                     .foregroundColor(accent)
             }
 
-            Text("需要先有一个 OXP 接收端提供 CarPlay 画面：① iPhone 装 OpenXPlay App（需 iOS 17.4+）开 CarPlay 会话，填手机 IP；② iOS 16 设备用 Relay 路线——备用安卓机装 OpenXPlay-Relay 或 UFI003 小盒子，USB 连 iPhone 拿画面，填它的 IP。本 App 与接收端同一 Wi-Fi。")
+            Text("需要先有一个 OXP 接收端提供 CarPlay 画面，任选其一：① CarWithin（本机 CarPlay，同机起 CarPlay 免盒子，未签名 IPA 需自签；作者演示用的就是它）；② OpenXPlay App（需 iOS 17.4+）；③ OpenXPlay Relay 路线（备用安卓机/小盒子 USB 连 iPhone，iPhone 上不装 App，适合 iOS 16）。本 App 与接收端同一 Wi-Fi，填它的 IP（默认端口 9888）。")
                 .font(.caption2)
                 .foregroundColor(.secondary)
         }

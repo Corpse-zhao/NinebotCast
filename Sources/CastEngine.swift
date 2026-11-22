@@ -439,9 +439,10 @@ final class CastEngine: ObservableObject {
         if pingSentTimes.count > 16 {
             pingSentTimes.removeValue(forKey: pingSentTimes.keys.first!)
         }
-        // 官方心跳（APP 子类型 5，参数 [0,2]）先发；再发计数变体兜底，两包都无害
-        controlChannel?.send(RTCP.heartbeat())
+        // 官方心跳（iOS 二进制逆向：计数器小端在 [12..15]、byte16=2）先发；
+        // 再发九号出行 App 的 [0,2] 变体做对照，两包都无害
         controlChannel?.send(RTCP.ping(counter: pingCounter))
+        controlChannel?.send(RTCP.heartbeat())
         if pingCounter == 1 {
             Diag.log("首个心跳已发出（官方 [0,2] + 计数变体）")
         }
@@ -475,7 +476,15 @@ final class CastEngine: ObservableObject {
             // 摄像头走事件驱动（onRendered → submit），不在这里轮询，
             // 否则每次节拍都白等最多一个帧间隔，延迟就是从这里多出来的
             if let photoBuffer {
-                submit(photoBuffer)
+                // 静态图每秒只编 1 帧（仪表收到新帧才重绘），不必按满帧率重编码同一张图
+                frameIndex &+= 1
+                if frameIndex % Int64(max(1, activeFps)) == 1, let encoder {
+                    inflightLock.lock()
+                    inflightFrames += 1
+                    inflightLock.unlock()
+                    encoder.encode(photoBuffer,
+                                   presentationTime: CMTime(value: frameIndex, timescale: activeFps))
+                }
                 return
             }
             if let pixelBuffer = TestImageSource.makeFrame(
