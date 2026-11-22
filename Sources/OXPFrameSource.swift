@@ -35,6 +35,7 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
     private var task: URLSessionWebSocketTask?
     private var formatDesc: CMVideoFormatDescription?
     private var decoderSession: VTDecompressionSession?
+    private var outputCtx: UnsafeMutableRawPointer?
 
     private var destBuffers: [CVPixelBuffer] = []
     private var destIndex = 0
@@ -301,6 +302,20 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
         srcWidth = w
         srcHeight = h
 
+        // 经典 C 回调（completionHandler 变体要 iOS 17，设备是 16.x 用不了）
+        let box = DecodeBox()
+        box.handler = { [weak self] buffer in self?.handleDecoded(buffer) }
+        let ctx = Unmanaged.passRetained(box).toOpaque()
+        outputCtx = ctx
+
+        var cbRecord = VTDecompressionOutputCallbackRecord(
+            decompressionOutputCallback: { refcon, _, _, _, _, imageBuffer, _, _ in
+                if let imageBuffer, let refcon {
+                    let box = Unmanaged<DecodeBox>.fromOpaque(refcon).takeUnretainedValue()
+                    box.handler(imageBuffer)
+                }
+            },
+            decompressionOutputRefCon: ctx)
         var sessionOut: VTDecompressionSession?
         // 不强制指定硬解 key（该常量 iOS 17 才有）：系统默认优先硬解
         let st2 = VTDecompressionSessionCreate(
@@ -308,9 +323,11 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
             formatDescription: fmt,
             decoderSpecification: nil,
             imageBufferAttributes: nil,
-            outputCallback: nil,
+            outputCallback: &cbRecord,
             decompressionSessionOut: &sessionOut)
         guard st2 == noErr, let sessionOut else {
+            Unmanaged<DecodeBox>.fromOpaque(ctx).release()
+            outputCtx = nil
             lock.unlock()
             Diag.log("OXP 解码会话创建失败 \(st2)")
             return
@@ -347,12 +364,9 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
         var infoFlags = VTDecodeInfoFlags()
         let st = VTDecompressionSessionDecodeFrame(
             session, sampleBuffer: sample,
-            flags: ._EnableAsynchronousDecompression,
-            infoFlagsOut: &infoFlags) { _, _, imageBuffer, _, _, _ in
-            if let buffer = imageBuffer {
-                self.handleDecoded(buffer)
-            }
-        }
+            decoderFlags: ._EnableAsynchronousDecompression,
+            infoFlagsOut: &infoFlags,
+            refcon: nil, outputCallback: nil)
         lock.unlock()
         if st != noErr {
             Diag.log("OXP 解码失败 \(st) key=\(isKey) size=\(payload.count)")
@@ -404,11 +418,20 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
             VTDecompressionSessionInvalidate(session)
         }
         decoderSession = nil
+        if let ctx = outputCtx {
+            Unmanaged<DecodeBox>.fromOpaque(ctx).release()
+        }
+        outputCtx = nil
         formatDesc = nil
         receivedFirstFrame = false
     }
 
     // MARK: - 工具
+
+    /// VT 解码回调的上下文（闭包不能直接进 refcon，套一层）
+    private final class DecodeBox {
+        var handler: ((CVPixelBuffer) -> Void)?
+    }
 
     /// 解析 avcC box 取 SPS/PPS（结构：version/profile/compat/level,
     /// lengthSizeMinusOne, numSPS, spsLen, SPS, numPPS, ppsLen, PPS）
