@@ -46,10 +46,19 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
     private var reconnectAttempt = 0
     private var reconnectTimer: DispatchSourceTimer?
     private var keyframeTimer: DispatchSourceTimer?
+    private var fallbackTimer: DispatchSourceTimer?
     private var srcWidth = 0
     private var srcHeight = 0
     private var receivedFirstFrame = false
     private var decodedCount = 0
+
+    /// 线协议：OXP（/oxp/v0，24 字节头）或 CarWithin（/stream，9 字节头）。
+    /// 接收端可能是 OpenXPlay、CarWithin 等，端口都是 9888 —— 自动探测：奇数次尝试
+    /// 走 OXP、偶数次走 CarWithin，谁先给出视频格式就锁谁，断线重连也优先用锁定的协议。
+    private enum WireMode { case oxp, carwithin }
+    private var lockedMode: WireMode?
+    private var wireMode: WireMode = .oxp
+    private var attemptCounter = 0
 
     init(host: String, port: Int, width: Int, height: Int, rotation: Int) {
         self.host = host
@@ -74,6 +83,7 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
         lock.unlock()
         reconnectTimer?.cancel(); reconnectTimer = nil
         keyframeTimer?.cancel(); keyframeTimer = nil
+        fallbackTimer?.cancel(); fallbackTimer = nil
         task?.cancel(with: .goingAway, reason: nil)
         session?.invalidateAndCancel()
         session = nil
@@ -95,19 +105,30 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
 
     private func connect() {
         guard running else { return }
+        attemptCounter += 1
         lock.lock()
         task?.cancel(with: .goingAway, reason: nil)
         session?.invalidateAndCancel()
         let cfg = URLSessionConfiguration.default
         cfg.timeoutIntervalForRequest = 8
         let s = URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
-        let url = URL(string: "ws://\(host):\(port)/oxp/v0")!
+        // 握手成功过的协议优先；否则自动探测轮换（先 OXP 后 CarWithin）
+        let mode: WireMode
+        if let m = lockedMode {
+            mode = m
+        } else {
+            mode = attemptCounter % 2 == 1 ? .oxp : .carwithin
+        }
+        wireMode = mode
+        let path = mode == .oxp ? "/oxp/v0" : "/stream"
+        let url = URL(string: "ws://\(host):\(port)\(path)")!
         let t = s.webSocketTask(with: url)
         session = s
         task = t
         lock.unlock()
-        report("正在连接 OpenXPlay \(host):\(port)…")
-        Diag.log("OXP 连接 ws://\(host):\(port)/oxp/v0")
+        let name = mode == .oxp ? "OXP" : "CarWithin"
+        report("正在连接接收端（\(name) 协议）\(host):\(port)…")
+        Diag.log("OXP 源连接 ws://\(host):\(port)\(path)（\(name)）")
         t.resume()
         receiveLoop()
     }
@@ -135,8 +156,14 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
     // URLSessionWebSocketDelegate
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask,
                     didOpenWithProtocol protocol: String?) {
-        sendHello()
-        startKeyframeNag()
+        if wireMode == .oxp {
+            sendHello()
+            startKeyframeNag()
+            startOxpFallback()
+        } else {
+            // CarWithin：先声明自己是 WebCodecs 网页端，服务端回 hello（带 avcC）
+            sendText(["type": "ready", "decoder": "webcodecs"])
+        }
     }
 
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask,
@@ -248,6 +275,9 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
             Diag.log("OXP welcome clientId=\(obj["clientId"] ?? "-")")
         case "video-format":
             handleVideoFormat(obj)
+        case "hello":
+            // CarWithin：hello 带 codec/description(base64 avcC)/width/height
+            handleCarWithinFormat(obj)
         case "ping":
             // 服务端 ping → 回 pong（带它给的 t0Us + 本地 t1/t2 微秒）
             let nowUs = Int64(Date().timeIntervalSince1970 * 1_000_000)
@@ -260,6 +290,44 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
         }
     }
 
+    /// OXP 模式下 4 秒还没拿到视频格式：多半是连到了不支持 OXP 的服务（比如
+    /// CarWithin 只开了浏览器共享），换下一种协议重连
+    private func startOxpFallback() {
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+        timer.schedule(deadline: .now() + 4)
+        timer.setEventHandler { [weak self] in
+            guard let self, self.running else { return }
+            self.lock.lock()
+            let got = self.formatDesc != nil
+            self.lock.unlock()
+            if !got {
+                Diag.log("OXP 路径 4 秒无视频格式，切换 CarWithin 协议重试")
+                self.lockedMode = nil
+                self.attemptCounter += 1   // 下次 connect 走另一条协议
+                self.task?.cancel(with: .goingAway, reason: nil)
+            }
+        }
+        timer.resume()
+        fallbackTimer?.cancel()
+        fallbackTimer = timer
+    }
+
+    private func cancelFallback() {
+        fallbackTimer?.cancel()
+        fallbackTimer = nil
+    }
+
+    private func handleCarWithinFormat(_ obj: [String: Any]) {
+        guard let descB64 = obj["description"] as? String,
+              let avcC = Data(base64Encoded: descB64) else {
+            Diag.log("CarWithin hello 缺 description")
+            return
+        }
+        let w = obj["width"] as? Int ?? 0
+        let h = obj["height"] as? Int ?? 0
+        installDecoder(avcC: avcC, w: w, h: h, tag: "CarWithin")
+    }
+
     private func handleVideoFormat(_ obj: [String: Any]) {
         guard let format = obj["format"] as? [String: Any],
               let configB64 = format["config"] as? String,
@@ -269,12 +337,17 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
         }
         let w = format["width"] as? Int ?? 0
         let h = format["height"] as? Int ?? 0
-        let fpsHint = format["fpsHint"] as? Int ?? 0
+        installDecoder(avcC: avcC, w: w, h: h, tag: "OXP")
+        sendText(["type": "keyframe", "screen": 0])   // OXP 支持主动要 I 帧
+    }
+
+    /// 建解码器（OXP 与 CarWithin 两条协议共用；需已持有 lock 之前先拿锁）
+    private func installDecoder(avcC: Data, w: Int, h: Int, tag: String) {
         lock.lock()
         teardownDecoderLocked()
         guard let (sps, pps) = Self.parseAvcC(avcC) else {
             lock.unlock()
-            Diag.log("OXP avcC 解析失败 \(avcC.count) 字节")
+            Diag.log("\(tag) avcC 解析失败 \(avcC.count) 字节")
             return
         }
         // CMVideoFormatDescriptionCreateFromH264ParameterSets 需要稳定的指针数组：
@@ -329,28 +402,41 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
             Unmanaged<DecodeBox>.fromOpaque(ctx).release()
             outputCtx = nil
             lock.unlock()
-            Diag.log("OXP 解码会话创建失败 \(st2)")
+            Diag.log("\(tag) 解码会话创建失败 \(st2)")
             return
         }
         formatDesc = fmt
         decoderSession = sessionOut
         receivedFirstFrame = false
+        lockedMode = wireMode      // 握手成功，锁定这条协议
+        cancelFallback()
         lock.unlock()
-        report("视频格式已收到 \(w)×\(h)，等首帧…")
-        Diag.log("OXP 解码器就绪 \(w)×\(h) fpsHint=\(fpsHint) avcC=\(avcC.count)B")
-        sendText(["type": "keyframe", "screen": 0])
+        report("\(tag) 视频格式已收到 \(w)×\(h)，等首帧…")
+        Diag.log("\(tag) 解码器就绪 \(w)×\(h) avcC=\(avcC.count)B（协议锁定）")
     }
 
     // MARK: - 二进制视频帧
 
     private func handleBinary(_ data: Data) {
-        guard data.count > 24 else { return }
-        let kind = data[data.startIndex]
-        guard kind == 1 else { return }               // 1=Video，其他忽略
-        let flags = data[data.startIndex + 2]
-        let isKey = (flags & 0x01) != 0
-        let ptsUs = Self.readI64LE(data, offset: 8)
-        let payload = data.subdata(in: (data.startIndex + 24)..<data.endIndex)  // AVCC 整帧
+        let ptsUs: Int64
+        let isKey: Bool
+        let payload: Data
+        if wireMode == .carwithin {
+            // CarWithin：[0]=关键帧标志(1=key)，[1..8]=大端 64 位微秒时间戳，[9:]=AVCC
+            guard data.count > 9 else { return }
+            isKey = data[data.startIndex] == 1
+            ptsUs = Self.readBE64(data, offset: 1)
+            payload = data.subdata(in: (data.startIndex + 9)..<data.endIndex)
+        } else {
+            // OXP：24 字节头（[0]=kind, [2]=flags, [8..15]=ptsUs 小端）
+            guard data.count > 24 else { return }
+            let kind = data[data.startIndex]
+            guard kind == 1 else { return }            // 1=Video，其他忽略
+            let flags = data[data.startIndex + 2]
+            isKey = (flags & 0x01) != 0
+            ptsUs = Self.readI64LE(data, offset: 8)
+            payload = data.subdata(in: (data.startIndex + 24)..<data.endIndex)
+        }
 
         lock.lock()
         guard let fmt = formatDesc, let session = decoderSession else {
@@ -370,7 +456,7 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
             infoFlagsOut: &infoFlags)
         lock.unlock()
         if st != noErr {
-            Diag.log("OXP 解码失败 \(st) key=\(isKey) size=\(payload.count)")
+            Diag.log("解码失败 \(st) key=\(isKey) size=\(payload.count)")
         }
     }
 
@@ -505,6 +591,14 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
         var v: Int64 = 0
         for i in 0..<8 {
             v |= Int64(data[data.startIndex + offset + i]) << (8 * i)
+        }
+        return v
+    }
+
+    private static func readBE64(_ data: Data, offset: Int) -> Int64 {
+        var v: Int64 = 0
+        for i in 0..<8 {
+            v = (v << 8) | Int64(data[data.startIndex + offset + i])
         }
         return v
     }

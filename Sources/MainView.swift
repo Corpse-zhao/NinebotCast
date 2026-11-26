@@ -539,7 +539,7 @@ struct MainView: View {
                     .foregroundColor(accent)
             }
 
-            Text("CarPlay 来源需要两个 App 配合：接收端（CarWithin / OpenXPlay / Relay，负责抓 CarPlay 画面）+ 本 App（负责投仪表），都在同一台手机上时地址填 127.0.0.1；接收端装在别的设备（如 Relay 盒子）时填它的 IP，端口默认 9888。注：图片/视频/摄像头来源不需要接收端。")
+            Text("CarPlay 来源需要两个 App 配合：接收端（CarWithin / OpenXPlay / Relay，负责抓 CarPlay 画面）+ 本 App（负责投仪表）。接收端在本机时地址填 127.0.0.1，装在别的设备填它的 IP，端口默认 9888。本 App 自动识别 OXP 与 CarWithin 两种共享协议，无需手动选。注：图片/视频/摄像头来源不需要接收端。")
                 .font(.caption2)
                 .foregroundColor(.secondary)
         }
