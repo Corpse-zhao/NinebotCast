@@ -29,11 +29,13 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
     private let width: Int
     private let height: Int
     private let rotation: Int
+    private let fpsHint: Int
 
     private let lock = NSLock()              // 保护 latestBuffer / 解码器 / 会话
     private var session: URLSession?
     private var task: URLSessionWebSocketTask?
     private var formatDesc: CMVideoFormatDescription?
+    private var installedAvcC: Data?
     private var decoderSession: VTDecompressionSession?
     private var outputCtx: UnsafeMutableRawPointer?
 
@@ -60,12 +62,26 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
     private var wireMode: WireMode = .oxp
     private var attemptCounter = 0
 
-    init(host: String, port: Int, width: Int, height: Int, rotation: Int) {
+    private var pingTimer: DispatchSourceTimer?
+    private var lastKeyRequest: TimeInterval = 0
+    private var displaySent = false
+    private var codecNudges = 0
+    /// CarWithin 用 viewer 标识这条接收会话，重连要沿用同一个
+    private var viewerID: String = {
+        let key = "nbc.viewerID"
+        if let v = UserDefaults.standard.string(forKey: key) { return v }
+        let v = UUID().uuidString
+        UserDefaults.standard.set(v, forKey: key)
+        return v
+    }()
+
+    init(host: String, port: Int, width: Int, height: Int, rotation: Int, fps: Int = 30) {
         self.host = host
         self.port = port
         self.width = width
         self.height = height
         self.rotation = rotation
+        self.fpsHint = fps
         super.init()
     }
 
@@ -84,6 +100,7 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
         reconnectTimer?.cancel(); reconnectTimer = nil
         keyframeTimer?.cancel(); keyframeTimer = nil
         fallbackTimer?.cancel(); fallbackTimer = nil
+        pingTimer?.cancel(); pingTimer = nil
         task?.cancel(with: .goingAway, reason: nil)
         session?.invalidateAndCancel()
         session = nil
@@ -116,6 +133,9 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
         let mode: WireMode
         if let m = lockedMode {
             mode = m
+        } else if attemptCounter == 1 {
+            // 上次成功过哪种协议就先试哪种，省掉一轮无用的探测
+            mode = UserDefaults.standard.string(forKey: "nbc.wireMode") == "carwithin" ? .carwithin : .oxp
         } else {
             mode = attemptCounter % 2 == 1 ? .oxp : .carwithin
         }
@@ -135,6 +155,7 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
 
     private func scheduleReconnect(_ why: String) {
         guard running else { return }
+        pingTimer?.cancel(); pingTimer = nil
         lock.lock()
         teardownDecoderLocked()
         lock.unlock()
@@ -161,8 +182,8 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
             startKeyframeNag()
             startOxpFallback()
         } else {
-            // CarWithin：先声明自己是 WebCodecs 网页端，服务端回 hello（带 avcC）
-            sendText(["type": "ready", "decoder": "webcodecs"])
+            // CarWithin：对齐官方接收页 boot() 的顺序 —— ready → display → audio，然后每秒 ping
+            startCarWithinSession()
         }
     }
 
@@ -232,10 +253,83 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
         keyframeTimer = timer
     }
 
+    // MARK: - CarWithin 会话（对齐官方接收页 boot 顺序）
+
+    /// 官方接收页顺序：ready(decoder/viewer/audioClock) → display(尺寸/h265) → audio(enabled)
+    /// 之后每秒 ping（t0 微秒）。缺 display 时服务端不知道该按什么尺寸、什么编码出流。
+    private func startCarWithinSession() {
+        displaySent = false
+        codecNudges = 0
+        sendCarWithin([
+            "type": "ready",
+            "decoder": "webcodecs",
+            "viewer": viewerID,
+            "audioClock": false
+        ])
+        sendCarWithinDisplay()
+        sendCarWithin(["type": "audio", "enabled": false])
+        startPing()
+        report("已连接，等待 CarPlay 画面…")
+        Diag.log("CarWithin ready → viewer=\(viewerID.prefix(8)) \(width)x\(height)@\(fpsHint)")
+    }
+
+    /// 告诉 CarWithin 接收端的分辨率与能力：h265 必须明确 false，否则可能下发 H.265
+    private func sendCarWithinDisplay() {
+        let dpr = 1
+        sendCarWithin([
+            "type": "display",
+            "w": width * dpr,
+            "h": height * dpr,
+            "dpr": dpr,
+            "sw": width * dpr,
+            "sh": height * dpr,
+            "hz": fpsHint,
+            "h265": false,
+            "fullscreen": true,
+            "ua": "NinebotCast/\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "-") (iOS)"
+        ])
+        displaySent = true
+    }
+
+    private func startPing() {
+        pingTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+        timer.schedule(deadline: .now() + 1, repeating: .seconds(1))
+        timer.setEventHandler { [weak self] in
+            guard let self, self.running, self.wireMode == .carwithin else { return }
+            let nowUs = Int64(Date().timeIntervalSince1970 * 1_000_000)
+            self.sendCarWithin(["type": "ping", "t0": nowUs])
+        }
+        timer.resume()
+        pingTimer = timer
+    }
+
+    /// 要关键帧：官方接收页限制 1 秒 1 次（一个 IDR 约等于 10 个普通帧）
+    private func askKeyframe(_ reason: String) {
+        let now = Date().timeIntervalSince1970
+        guard now - lastKeyRequest >= 1.0 else { return }
+        lastKeyRequest = now
+        if wireMode == .carwithin {
+            sendCarWithin(["type": "keyframe", "reason": reason])
+        } else {
+            sendText(["type": "keyframe", "screen": 0])
+        }
+    }
+
+    /// OXP：服务端按二进制帧解析 JSON，沿用 .data
     private func sendText(_ json: [String: Any]) {
         guard JSONSerialization.isValidJSONObject(json),
               let data = try? JSONSerialization.data(withJSONObject: json) else { return }
         task?.send(.data(data)) { _ in }
+    }
+
+    /// CarWithin：接收页用 `typeof e.data === 'string'` 区分控制消息和视频包，
+    /// 发成二进制会被当成 H.264 帧直接丢掉，所以控制 JSON 必须走文本帧。
+    private func sendCarWithin(_ json: [String: Any]) {
+        guard JSONSerialization.isValidJSONObject(json),
+              let data = try? JSONSerialization.data(withJSONObject: json),
+              let text = String(data: data, encoding: .utf8) else { return }
+        task?.send(.string(text)) { _ in }
     }
 
     private func report(_ msg: String) {
@@ -275,14 +369,21 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
             Diag.log("OXP welcome clientId=\(obj["clientId"] ?? "-")")
         case "video-format":
             handleVideoFormat(obj)
-        case "hello":
-            // CarWithin：hello 带 codec/description(base64 avcC)/width/height
+        case "format":
+            // CarWithin 真正的视频参数在这里（不是 hello）：
+            // {page, decoder, codec, description=base64 avcC, width, height, fps, name}
             handleCarWithinFormat(obj)
+        case "hello":
+            // CarWithin 的 hello 只带页面版本/性能档/是否提供声音，不含编码参数
+            Diag.log("CarWithin hello page=\(obj["page"] ?? "-") audio=\(obj["audio"] ?? "-")")
         case "ping":
             // 服务端 ping → 回 pong（带它给的 t0Us + 本地 t1/t2 微秒）
             let nowUs = Int64(Date().timeIntervalSince1970 * 1_000_000)
             let t0 = obj["t0Us"] as? Int64 ?? 0
             sendText(["type": "pong", "t0Us": t0, "t1Us": nowUs, "t2Us": nowUs])
+        case "pong":
+            // CarWithin：{type:pong, t0, s}，只用它做时钟对账，不必回
+            break
         case "pause":
             Diag.log("OXP pause=\(obj["paused"] ?? "-")")
         default:
@@ -318,13 +419,28 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
     }
 
     private func handleCarWithinFormat(_ obj: [String: Any]) {
-        guard let descB64 = obj["description"] as? String,
-              let avcC = Data(base64Encoded: descB64) else {
-            Diag.log("CarWithin hello 缺 description")
+        let codec = obj["codec"] as? String ?? "avc1"
+        let w = Self.intOf(obj, "width")
+        let h = Self.intOf(obj, "height")
+        let fps = Self.intOf(obj, "fps")
+        let name = obj["name"] as? String ?? codec
+        // CarWithin 只有 H.265 没被明确拒绝时才下发 hvc1；我们的解码链路是 H.264
+        if codec.hasPrefix("hvc1") || codec.hasPrefix("hev1") {
+            Diag.log("CarWithin 下发了 H.265（\(codec)），当前无法解码")
+            report("接收端在用 H.265，本 App 只支持 H.264 —— 请在 CarWithin 的画面设置里改成 H.264")
+            if codecNudges < 2 {
+                codecNudges += 1
+                sendCarWithinDisplay()      // 再明确一次 h265=false，逼服务端转 H.264
+            }
             return
         }
-        let w = obj["width"] as? Int ?? 0
-        let h = obj["height"] as? Int ?? 0
+        guard let descB64 = obj["description"] as? String,
+              let avcC = Data(base64Encoded: descB64) else {
+            Diag.log("CarWithin format 缺 description（codec=\(codec)）")
+            askKeyframe("no-format")
+            return
+        }
+        Diag.log("CarWithin format \(name) \(w)x\(h) \(fps)fps avcC=\(avcC.count)B")
         installDecoder(avcC: avcC, w: w, h: h, tag: "CarWithin")
     }
 
@@ -335,8 +451,8 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
             Diag.log("OXP video-format 缺 config")
             return
         }
-        let w = format["width"] as? Int ?? 0
-        let h = format["height"] as? Int ?? 0
+        let w = Self.intOf(format, "width")
+        let h = Self.intOf(format, "height")
         installDecoder(avcC: avcC, w: w, h: h, tag: "OXP")
         sendText(["type": "keyframe", "screen": 0])   // OXP 支持主动要 I 帧
     }
@@ -344,6 +460,11 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
     /// 建解码器（OXP 与 CarWithin 两条协议共用；需已持有 lock 之前先拿锁）
     private func installDecoder(avcC: Data, w: Int, h: Int, tag: String) {
         lock.lock()
+        // 服务端重复下发同样的 format 时不要重建解码器（会打断正在解的画面）
+        if let prev = installedAvcC, prev == avcC, srcWidth == w, srcHeight == h, decoderSession != nil {
+            lock.unlock()
+            return
+        }
         teardownDecoderLocked()
         guard let (sps, pps) = Self.parseAvcC(avcC) else {
             lock.unlock()
@@ -407,10 +528,13 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
         }
         formatDesc = fmt
         decoderSession = sessionOut
+        installedAvcC = avcC
         receivedFirstFrame = false
         lockedMode = wireMode      // 握手成功，锁定这条协议
+        UserDefaults.standard.set(wireMode == .carwithin ? "carwithin" : "oxp", forKey: "nbc.wireMode")
         cancelFallback()
         lock.unlock()
+        if wireMode == .carwithin { askKeyframe("decoder-ready") }
         report("\(tag) 视频格式已收到 \(w)×\(h)，等首帧…")
         Diag.log("\(tag) 解码器就绪 \(w)×\(h) avcC=\(avcC.count)B（协议锁定）")
     }
@@ -422,9 +546,11 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
         let isKey: Bool
         let payload: Data
         if wireMode == .carwithin {
-            // CarWithin：[0]=关键帧标志(1=key)，[1..8]=大端 64 位微秒时间戳，[9:]=AVCC
+            // CarWithin：[0]=关键帧标志(1=key，3=音频包)，[1..8]=大端 64 位微秒时间戳，[9:]=AVCC
             guard data.count > 9 else { return }
-            isKey = data[data.startIndex] == 1
+            let flag = data[data.startIndex]
+            if flag == 3 { return }                     // 音频包（我们没开声音）
+            isKey = flag == 1
             ptsUs = Self.readBE64(data, offset: 1)
             payload = data.subdata(in: (data.startIndex + 9)..<data.endIndex)
         } else {
@@ -510,6 +636,7 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
         }
         outputCtx = nil
         formatDesc = nil
+        installedAvcC = nil
         receivedFirstFrame = false
     }
 
@@ -585,6 +712,15 @@ final class OXPFrameSource: NSObject, URLSessionWebSocketDelegate {
             sampleBufferOut: &sample)
         guard st == noErr else { return nil }
         return sample
+    }
+
+    /// JSON 数字可能是 Int / Double / NSNumber / 字符串，统一取整
+    static func intOf(_ obj: [String: Any], _ key: String) -> Int {
+        if let i = obj[key] as? Int { return i }
+        if let d = obj[key] as? Double { return Int(d) }
+        if let n = obj[key] as? NSNumber { return n.intValue }
+        if let s = obj[key] as? String { return Int(s) ?? 0 }
+        return 0
     }
 
     private static func readI64LE(_ data: Data, offset: Int) -> Int64 {

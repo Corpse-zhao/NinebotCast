@@ -195,7 +195,7 @@ final class CastEngine: ObservableObject {
         }
         let source = OXPFrameSource(host: oxpHost, port: oxpPort,
                                     width: preset.width, height: preset.height,
-                                    rotation: oxpRotation)
+                                    rotation: oxpRotation, fps: Int(activeFps))
         source.onStatus = { [weak self] msg in
             DispatchQueue.main.async {
                 self?.dashboardReport = "CarPlay：\(msg)"

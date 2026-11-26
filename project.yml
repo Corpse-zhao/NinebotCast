@@ -31,11 +31,11 @@ targets:
       path: Support/Info.plist
       properties:
         CFBundleDisplayName: Ninebot Cast
-        CFBundleShortVersionString: "0.24.0"
-        CFBundleVersion: "24"
+        CFBundleShortVersionString: "0.25.0"
+        CFBundleVersion: "25"
         UILaunchScreen: {}
         UIBackgroundModes: [audio]
-        NSLocalNetworkUsageDescription: 用于连接九号仪表并发送投屏画面（UDP 5012/5013），以及连接 OpenXPlay 获取 CarPlay 画面（WebSocket 9888）。
+        NSLocalNetworkUsageDescription: 用于连接九号仪表并发送投屏画面（UDP 5012/5013），以及连接 CarWithin / OpenXPlay 接收端获取 CarPlay 画面（WebSocket 9888）。
         NSCameraUsageDescription: 用于摄像头画面投屏。
         NSPhotoLibraryUsageDescription: 用于相册图片和视频投屏。
         UISupportedInterfaceOrientations:
